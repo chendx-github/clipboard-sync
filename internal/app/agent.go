@@ -148,6 +148,9 @@ func (a *Agent) publishText(text string) error {
 	if err := a.mq.Publish(protocol.TopicClipboardUpdate, message); err != nil {
 		return err
 	}
+	if err := a.flushMQ(5 * time.Second); err != nil {
+		return err
+	}
 	a.logger.Info("clipboard text update published")
 	return nil
 }
@@ -165,6 +168,9 @@ func (a *Agent) publishFiles(paths []string) error {
 	if err := a.mq.Publish(protocol.TopicClipboardUpdate, message); err != nil {
 		return err
 	}
+	if err := a.flushMQ(5 * time.Second); err != nil {
+		return err
+	}
 	a.logger.Info("clipboard file metadata published", "token", token, "files", len(files))
 	return nil
 }
@@ -180,6 +186,9 @@ func (a *Agent) publishImage(image []byte, mime string) error {
 	}
 	message := protocol.NewImageUpdate(a.deviceID, token, meta)
 	if err := a.mq.Publish(protocol.TopicClipboardUpdate, message); err != nil {
+		return err
+	}
+	if err := a.flushMQ(5 * time.Second); err != nil {
 		return err
 	}
 	if err := a.imageSender.Broadcast(token, meta, path); err != nil {
@@ -483,6 +492,12 @@ func (a *Agent) setSuppressFingerprintFor(fingerprint string, duration time.Dura
 	if fingerprint != "" {
 		a.lastSeen = fingerprint
 	}
+}
+
+func (a *Agent) flushMQ(timeout time.Duration) error {
+	flushCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return a.mq.Flush(flushCtx)
 }
 
 func imageSuppressDuration(size int) time.Duration {

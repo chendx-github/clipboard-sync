@@ -193,8 +193,5 @@ func ValidateFileMeta(meta FileMeta) error {
 	if meta.Size < 0 {
 		return fmt.Errorf("file size is invalid")
 	}
-	if meta.SHA256 == "" {
-		return fmt.Errorf("file sha256 is empty")
-	}
 	return nil
 }

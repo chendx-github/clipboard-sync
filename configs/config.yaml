@@ -1,6 +1,6 @@
 device_id: "linux-A"
 nats_url: "nats://localhost:4222"
-chunk_size: 1048576
+chunk_size: 8388608
 token_ttl: 60
 poll_interval_ms: 500
 cache_dir: ""

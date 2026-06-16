@@ -42,7 +42,7 @@ func applyDefaults(cfg *Config) {
 		cfg.NATSURL = "nats://localhost:4222"
 	}
 	if cfg.ChunkSize <= 0 {
-		cfg.ChunkSize = 1024 * 1024
+		cfg.ChunkSize = 8 * 1024 * 1024
 	}
 	if cfg.TokenTTL <= 0 {
 		cfg.TokenTTL = 60

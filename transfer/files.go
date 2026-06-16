@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -69,31 +68,13 @@ func buildSingleFileMetadata(path string, name string) (protocol.FileMeta, error
 	if err != nil {
 		return protocol.FileMeta{}, fmt.Errorf("stat %s: %w", path, err)
 	}
-	sha, err := sha256File(path)
-	if err != nil {
-		return protocol.FileMeta{}, err
-	}
 	return protocol.FileMeta{
 		ID:       fileID(path, info),
 		Name:     name,
 		Path:     path,
 		Size:     info.Size(),
-		SHA256:   sha,
 		Modified: info.ModTime().Unix(),
 	}, nil
-}
-
-func sha256File(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", fmt.Errorf("open %s: %w", path, err)
-	}
-	defer file.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, file); err != nil {
-		return "", fmt.Errorf("hash %s: %w", path, err)
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func fileID(path string, info os.FileInfo) string {
@@ -104,7 +85,7 @@ func fileID(path string, info os.FileInfo) string {
 
 func ChunkTotal(size int64, chunkSize int) int {
 	if size == 0 {
-		return 1
+		return 0
 	}
 	total := size / int64(chunkSize)
 	if size%int64(chunkSize) != 0 {
@@ -129,7 +110,7 @@ func NewChunkMessage(token string, file protocol.FileMeta, sourceDevice string, 
 	}
 }
 
-func NewCompleteMessage(token string, file protocol.FileMeta, sourceDevice string, targetDevice string, totalChunks int) protocol.FileCompleteMessage {
+func NewCompleteMessage(token string, file protocol.FileMeta, sourceDevice string, targetDevice string, totalChunks int, sha256Hex string) protocol.FileCompleteMessage {
 	return protocol.FileCompleteMessage{
 		Event:        protocol.TopicFileComplete,
 		Token:        token,
@@ -137,7 +118,7 @@ func NewCompleteMessage(token string, file protocol.FileMeta, sourceDevice strin
 		FileName:     file.Name,
 		SourceDevice: sourceDevice,
 		TargetDevice: targetDevice,
-		SHA256:       file.SHA256,
+		SHA256:       sha256Hex,
 		Size:         file.Size,
 		TotalChunks:  totalChunks,
 		CompletedAt:  time.Now().Unix(),

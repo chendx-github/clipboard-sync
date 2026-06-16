@@ -2,7 +2,9 @@ package transfer
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,8 +23,11 @@ type Sender struct {
 }
 
 const (
-	maxFileChunkPayload = 512 * 1024
-	fileChunkPause      = 2 * time.Millisecond
+	messageOverheadBytes = 4096
+	base64ExpansionRatio = 4.0 / 3.0
+	flushEveryChunks     = 16
+	flushEveryBytes      = 32 * 1024 * 1024
+	minFileChunkPayload  = 64 * 1024
 )
 
 func NewSender(chunkSize int, client *mq.Client, logger *slog.Logger, deviceID string) *Sender {
@@ -45,13 +50,13 @@ func (s *Sender) sendSingleFile(ctx context.Context, token string, file protocol
 	}
 	defer handle.Close()
 
-	chunkSize := s.chunkSize
-	if chunkSize <= 0 || chunkSize > maxFileChunkPayload {
-		chunkSize = maxFileChunkPayload
-	}
+	chunkSize := s.effectiveChunkSize()
 	buffer := make([]byte, chunkSize)
 	total := ChunkTotal(file.Size, chunkSize)
+	hash := sha256.New()
 	seq := 1
+	unflushedChunks := 0
+	unflushedBytes := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -61,16 +66,22 @@ func (s *Sender) sendSingleFile(ctx context.Context, token string, file protocol
 
 		n, readErr := handle.Read(buffer)
 		if n > 0 {
+			if _, err := hash.Write(buffer[:n]); err != nil {
+				return fmt.Errorf("hash file %s: %w", file.Path, err)
+			}
 			payload := base64.StdEncoding.EncodeToString(buffer[:n])
 			chunkMessage := NewChunkMessage(token, file, s.deviceID, targetDevice, seq, total, payload, n)
 			if err := s.mq.Publish(protocol.TopicFileChunk, chunkMessage); err != nil {
 				return err
 			}
-			if err := s.flush(ctx); err != nil {
-				return err
-			}
-			if err := pause(ctx, fileChunkPause); err != nil {
-				return err
+			unflushedChunks++
+			unflushedBytes += n
+			if unflushedChunks >= flushEveryChunks || unflushedBytes >= flushEveryBytes {
+				if err := s.flush(ctx); err != nil {
+					return err
+				}
+				unflushedChunks = 0
+				unflushedBytes = 0
 			}
 			seq++
 		}
@@ -81,30 +92,36 @@ func (s *Sender) sendSingleFile(ctx context.Context, token string, file protocol
 			return fmt.Errorf("read file %s: %w", file.Path, readErr)
 		}
 	}
-	completeMessage := NewCompleteMessage(token, file, s.deviceID, targetDevice, total)
+	sha256Hex := hex.EncodeToString(hash.Sum(nil))
+	completeMessage := NewCompleteMessage(token, file, s.deviceID, targetDevice, total, sha256Hex)
 	if err := s.mq.Publish(protocol.TopicFileComplete, completeMessage); err != nil {
 		return err
 	}
 	if err := s.flush(ctx); err != nil {
 		return err
 	}
-	s.logger.Info("file sent", "token", token, "file", file.Name, "chunks", total, "target_device", targetDevice)
+	s.logger.Info("file sent", "token", token, "file", file.Name, "chunks", total, "chunk_size", chunkSize, "target_device", targetDevice)
 	return nil
+}
+
+func (s *Sender) effectiveChunkSize() int {
+	maxPayload := s.mq.MaxPayload()
+	safePayload := int64(minFileChunkPayload)
+	if maxPayload > messageOverheadBytes {
+		safePayload = int64(float64(maxPayload-messageOverheadBytes) / base64ExpansionRatio)
+	}
+	if safePayload < minFileChunkPayload {
+		safePayload = minFileChunkPayload
+	}
+	chunkSize := s.chunkSize
+	if chunkSize <= 0 || int64(chunkSize) > safePayload {
+		chunkSize = int(safePayload)
+	}
+	return chunkSize
 }
 
 func (s *Sender) flush(ctx context.Context) error {
 	flushCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	return s.mq.Flush(flushCtx)
-}
-
-func pause(ctx context.Context, duration time.Duration) error {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }

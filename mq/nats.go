@@ -58,6 +58,10 @@ func (c *Client) Flush(ctx context.Context) error {
 	return c.conn.FlushWithContext(ctx)
 }
 
+func (c *Client) MaxPayload() int64 {
+	return c.conn.MaxPayload()
+}
+
 func (c *Client) Close() {
 	for _, sub := range c.subs {
 		_ = sub.Unsubscribe()
