@@ -1,0 +1,9 @@
+device_id: "linux-A"
+nats_url: "nats://localhost:4222"
+chunk_size: 1048576
+token_ttl: 60
+poll_interval_ms: 500
+cache_dir: ""
+download_dir: ""
+mount_dir: ""
+log_level: "info"

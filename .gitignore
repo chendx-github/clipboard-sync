@@ -1,0 +1,6 @@
+agent
+agent.exe
+*.log
+downloads/
+cache/
+tmp/
