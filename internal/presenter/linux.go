@@ -63,7 +63,6 @@ func (p *linuxPresenter) PresentRemoteFiles(state cache.RemoteClipboardState) (P
 	defer p.mu.Unlock()
 	p.state = state
 	p.names = map[string]protocol.FileMeta{}
-	paths := make([]string, 0, len(state.Files))
 	used := map[string]int{}
 	for _, file := range state.Files {
 		base := sanitizeRelativeName(file.Name)
@@ -73,8 +72,8 @@ func (p *linuxPresenter) PresentRemoteFiles(state cache.RemoteClipboardState) (P
 		}
 		used[base]++
 		p.names[name] = file
-		paths = append(paths, filepath.Join(p.root, name))
 	}
+	paths := topLevelPaths(p.root, p.names)
 	sort.Strings(paths)
 	return Presentation{Paths: paths}, nil
 }
@@ -118,7 +117,8 @@ type rootNode struct {
 }
 
 func (n *rootNode) Attr(_ context.Context, attr *fuse.Attr) error {
-	attr.Mode = os.ModeDir | 0o555
+	attr.Mode = os.ModeDir | 0o755
+	setCurrentOwner(attr)
 	return nil
 }
 
@@ -147,7 +147,8 @@ type dirNode struct {
 }
 
 func (n *dirNode) Attr(_ context.Context, attr *fuse.Attr) error {
-	attr.Mode = os.ModeDir | 0o555
+	attr.Mode = os.ModeDir | 0o755
+	setCurrentOwner(attr)
 	return nil
 }
 
@@ -177,10 +178,11 @@ type fileNode struct {
 }
 
 func (n *fileNode) Attr(_ context.Context, attr *fuse.Attr) error {
-	attr.Mode = 0o444
+	attr.Mode = 0o644
 	attr.Size = uint64(n.meta.Size)
 	attr.Mtime = time.Unix(n.meta.Modified, 0)
 	attr.Ctime = attr.Mtime
+	setCurrentOwner(attr)
 	return nil
 }
 
@@ -245,4 +247,24 @@ func hasChildPrefix(files map[string]protocol.FileMeta, prefix string) bool {
 		}
 	}
 	return false
+}
+
+func topLevelPaths(root string, files map[string]protocol.FileMeta) []string {
+	seen := map[string]struct{}{}
+	for name := range files {
+		part, _, _ := strings.Cut(name, "/")
+		if part != "" {
+			seen[part] = struct{}{}
+		}
+	}
+	paths := make([]string, 0, len(seen))
+	for name := range seen {
+		paths = append(paths, filepath.Join(root, name))
+	}
+	return paths
+}
+
+func setCurrentOwner(attr *fuse.Attr) {
+	attr.Uid = uint32(os.Getuid())
+	attr.Gid = uint32(os.Getgid())
 }

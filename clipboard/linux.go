@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -179,7 +180,10 @@ func parseClipboardFileList(payload string) ([]string, error) {
 			continue
 		}
 		if strings.HasPrefix(line, "file://") {
-			path := strings.TrimPrefix(line, "file://")
+			path, err := fileURIToPath(line)
+			if err != nil {
+				return nil, err
+			}
 			files = append(files, path)
 			continue
 		}
@@ -221,14 +225,12 @@ func (c *linuxClipboard) writeFiles(files []string) error {
 			return fmt.Errorf("stat %s: %w", path, err)
 		}
 	}
-	var builder strings.Builder
-	builder.WriteString("copy\n")
+	lines := make([]string, 0, len(files)+1)
+	lines = append(lines, "copy")
 	for _, path := range files {
-		builder.WriteString("file://")
-		builder.WriteString(path)
-		builder.WriteString("\n")
+		lines = append(lines, pathToFileURI(path))
 	}
-	payload := builder.String()
+	payload := strings.Join(lines, "\n")
 	if c.backend == backendWayland {
 		cmd := exec.Command("wl-copy", "--type", "x-special/gnome-copied-files")
 		cmd.Stdin = strings.NewReader(payload)
@@ -243,6 +245,24 @@ func (c *linuxClipboard) writeFiles(files []string) error {
 		return fmt.Errorf("write xclip files: %w", err)
 	}
 	return nil
+}
+
+func pathToFileURI(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String()
+}
+
+func fileURIToPath(uri string) (string, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return "", fmt.Errorf("parse file uri %q: %w", uri, err)
+	}
+	if parsed.Scheme != "file" {
+		return "", fmt.Errorf("unsupported uri scheme: %s", parsed.Scheme)
+	}
+	if parsed.Host != "" && parsed.Host != "localhost" {
+		return "", fmt.Errorf("unsupported file uri host: %s", parsed.Host)
+	}
+	return parsed.Path, nil
 }
 
 func (c *linuxClipboard) readImage() ([]byte, string, error) {
