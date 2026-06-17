@@ -31,9 +31,15 @@ type Receiver struct {
 	callback Callback
 	mu       sync.Mutex
 	sessions map[string]*fileSession
+	stopCh   chan struct{}
 }
 
-const readWaitTimeout = 2 * time.Minute
+const (
+	readWaitTimeout      = 2 * time.Minute
+	transferSessionTTL   = 10 * time.Minute
+	maxPendingChunks     = 1024
+	maxPendingChunkBytes = 1024 * 1024 * 1024
+)
 
 type fileSession struct {
 	mu           sync.Mutex
@@ -46,7 +52,10 @@ type fileSession struct {
 	nextSeq      int
 	total        int
 	pending      map[int][]byte
+	pendingBytes int64
 	available    int64
+	createdAt    time.Time
+	lastSeen     time.Time
 	completed    bool
 	completeSeen bool
 	failed       error
@@ -54,7 +63,13 @@ type fileSession struct {
 }
 
 func NewReceiver(root string, callback Callback) *Receiver {
-	return &Receiver{root: root, callback: callback, sessions: map[string]*fileSession{}}
+	receiver := &Receiver{root: root, callback: callback, sessions: map[string]*fileSession{}, stopCh: make(chan struct{})}
+	go receiver.gcLoop()
+	return receiver
+}
+
+func (r *Receiver) Close() {
+	close(r.stopCh)
 }
 
 func (r *Receiver) PrepareFiles(token string, files []protocol.FileMeta) error {
@@ -71,6 +86,9 @@ func (r *Receiver) HandleChunk(msg protocol.FileChunkMessage) error {
 	if err != nil {
 		return r.fail(msg.Token, fmt.Errorf("decode base64 chunk: %w", err))
 	}
+	if len(decoded) != msg.Size {
+		return r.fail(msg.Token, fmt.Errorf("chunk size mismatch token=%s file=%s seq=%d want=%d got=%d", msg.Token, msg.FileName, msg.Seq, msg.Size, len(decoded)))
+	}
 	session, err := r.sessionForChunk(msg)
 	if err != nil {
 		return err
@@ -81,6 +99,7 @@ func (r *Receiver) HandleChunk(msg protocol.FileChunkMessage) error {
 	if session.failed != nil || session.completed {
 		return session.failed
 	}
+	session.lastSeen = time.Now()
 	if session.total == 0 {
 		session.total = msg.Total
 	}
@@ -91,11 +110,11 @@ func (r *Receiver) HandleChunk(msg protocol.FileChunkMessage) error {
 		return nil
 	}
 	if session.total > 0 && msg.Seq > session.total {
-		return r.fail(msg.Token, fmt.Errorf("chunk seq %d exceeds total %d", msg.Seq, session.total))
+		return r.failSession(session, fmt.Errorf("chunk seq %d exceeds total %d", msg.Seq, session.total))
 	}
 	if msg.Seq == session.nextSeq {
 		if err := session.write(decoded); err != nil {
-			return r.fail(msg.Token, err)
+			return r.failSession(session, err)
 		}
 		session.nextSeq++
 		for {
@@ -104,8 +123,9 @@ func (r *Receiver) HandleChunk(msg protocol.FileChunkMessage) error {
 				break
 			}
 			delete(session.pending, session.nextSeq)
+			session.pendingBytes -= int64(len(buffered))
 			if err := session.write(buffered); err != nil {
-				return r.fail(msg.Token, err)
+				return r.failSession(session, err)
 			}
 			session.nextSeq++
 		}
@@ -115,7 +135,11 @@ func (r *Receiver) HandleChunk(msg protocol.FileChunkMessage) error {
 		}
 		return nil
 	}
+	if len(session.pending) >= maxPendingChunks || session.pendingBytes+int64(len(decoded)) > maxPendingChunkBytes {
+		return r.failSession(session, fmt.Errorf("too many pending chunks token=%s file=%s", msg.Token, msg.FileName))
+	}
 	session.pending[msg.Seq] = decoded
+	session.pendingBytes += int64(len(decoded))
 	return nil
 }
 
@@ -129,6 +153,7 @@ func (r *Receiver) HandleComplete(msg protocol.FileCompleteMessage) error {
 	if session.completed {
 		return nil
 	}
+	session.lastSeen = time.Now()
 	session.completeSeen = true
 	session.file.Name = msg.FileName
 	session.file.Size = msg.Size
@@ -146,22 +171,22 @@ func (r *Receiver) HandleComplete(msg protocol.FileCompleteMessage) error {
 func (r *Receiver) finish(session *fileSession, sha256Hex string, size int64, totalChunks int) error {
 	if !session.closedWriter {
 		if err := session.writer.Sync(); err != nil {
-			return r.fail(session.token, fmt.Errorf("sync file: %w", err))
+			return r.failSession(session, fmt.Errorf("sync file: %w", err))
 		}
 		if err := session.writer.Close(); err != nil {
-			return r.fail(session.token, fmt.Errorf("close file: %w", err))
+			return r.failSession(session, fmt.Errorf("close file: %w", err))
 		}
 		session.closedWriter = true
 	}
 	computed := hex.EncodeToString(session.hash.Sum(nil))
 	if computed != sha256Hex {
-		return r.fail(session.token, fmt.Errorf("sha mismatch for %s want=%s got=%s", session.file.Name, sha256Hex, computed))
+		return r.failSession(session, fmt.Errorf("sha mismatch for %s want=%s got=%s", session.file.Name, sha256Hex, computed))
 	}
 	if session.available != size {
-		return r.fail(session.token, fmt.Errorf("size mismatch for %s want=%d got=%d", session.file.Name, size, session.available))
+		return r.failSession(session, fmt.Errorf("size mismatch for %s want=%d got=%d", session.file.Name, size, session.available))
 	}
 	if session.nextSeq-1 != totalChunks {
-		return r.fail(session.token, fmt.Errorf("chunk count mismatch for %s want=%d got=%d", session.file.Name, totalChunks, session.nextSeq-1))
+		return r.failSession(session, fmt.Errorf("chunk count mismatch for %s want=%d got=%d", session.file.Name, totalChunks, session.nextSeq-1))
 	}
 	session.completed = true
 	session.cond.Broadcast()
@@ -245,14 +270,17 @@ func (r *Receiver) prepareFile(token string, file protocol.FileMeta) error {
 	if err != nil {
 		return fmt.Errorf("create spool file: %w", err)
 	}
+	now := time.Now()
 	session := &fileSession{
-		token:   token,
-		file:    file,
-		path:    path,
-		writer:  writer,
-		hash:    sha256.New(),
-		nextSeq: 1,
-		pending: map[int][]byte{},
+		token:     token,
+		file:      file,
+		path:      path,
+		writer:    writer,
+		hash:      sha256.New(),
+		nextSeq:   1,
+		pending:   map[int][]byte{},
+		createdAt: now,
+		lastSeen:  now,
 	}
 	session.cond = sync.NewCond(&session.mu)
 	r.sessions[key] = session
@@ -288,6 +316,42 @@ func (r *Receiver) lookup(token string, fileID string) (*fileSession, bool) {
 	return session, ok
 }
 
+func (r *Receiver) gcLoop() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.expireStaleSessions()
+		case <-r.stopCh:
+			return
+		}
+	}
+}
+
+func (r *Receiver) expireStaleSessions() {
+	now := time.Now()
+	expired := map[string]struct{}{}
+	r.mu.Lock()
+	sessions := make([]*fileSession, 0, len(r.sessions))
+	for _, session := range r.sessions {
+		sessions = append(sessions, session)
+	}
+	r.mu.Unlock()
+	for _, session := range sessions {
+		session.mu.Lock()
+		stale := !session.completed && session.failed == nil && now.Sub(session.lastSeen) > transferSessionTTL
+		token := session.token
+		session.mu.Unlock()
+		if stale {
+			expired[token] = struct{}{}
+		}
+	}
+	for token := range expired {
+		_ = r.fail(token, fmt.Errorf("transfer session timed out after %s", transferSessionTTL))
+	}
+}
+
 func (r *Receiver) fail(token string, err error) error {
 	r.mu.Lock()
 	var sessions []*fileSession
@@ -307,6 +371,37 @@ func (r *Receiver) fail(token string, err error) error {
 		}
 		session.cond.Broadcast()
 		session.mu.Unlock()
+	}
+	if callbackErr := r.callback.OnTransferError(token, err); callbackErr != nil {
+		return fmt.Errorf("%v; callback error: %w", err, callbackErr)
+	}
+	return err
+}
+
+func (r *Receiver) failSession(lockedSession *fileSession, err error) error {
+	token := lockedSession.token
+	r.mu.Lock()
+	var sessions []*fileSession
+	for key, session := range r.sessions {
+		if session.token == token {
+			sessions = append(sessions, session)
+			delete(r.sessions, key)
+		}
+	}
+	r.mu.Unlock()
+	for _, session := range sessions {
+		if session != lockedSession {
+			session.mu.Lock()
+		}
+		session.failed = err
+		if session.writer != nil && !session.closedWriter {
+			_ = session.writer.Close()
+			session.closedWriter = true
+		}
+		session.cond.Broadcast()
+		if session != lockedSession {
+			session.mu.Unlock()
+		}
 	}
 	if callbackErr := r.callback.OnTransferError(token, err); callbackErr != nil {
 		return fmt.Errorf("%v; callback error: %w", err, callbackErr)

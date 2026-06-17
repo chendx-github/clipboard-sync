@@ -94,9 +94,10 @@ func ChunkTotal(size int64, chunkSize int) int {
 	return int(total)
 }
 
-func NewChunkMessage(token string, file protocol.FileMeta, sourceDevice string, targetDevice string, seq int, total int, data string, size int) protocol.FileChunkMessage {
+func NewChunkMessage(groupID string, token string, file protocol.FileMeta, sourceDevice string, targetDevice string, seq int, total int, data string, size int) protocol.FileChunkMessage {
 	return protocol.FileChunkMessage{
 		Event:        protocol.TopicFileChunk,
+		GroupID:      groupID,
 		Token:        token,
 		FileID:       file.ID,
 		FileName:     file.Name,
@@ -110,9 +111,10 @@ func NewChunkMessage(token string, file protocol.FileMeta, sourceDevice string, 
 	}
 }
 
-func NewCompleteMessage(token string, file protocol.FileMeta, sourceDevice string, targetDevice string, totalChunks int, sha256Hex string) protocol.FileCompleteMessage {
+func NewCompleteMessage(groupID string, token string, file protocol.FileMeta, sourceDevice string, targetDevice string, totalChunks int, sha256Hex string) protocol.FileCompleteMessage {
 	return protocol.FileCompleteMessage{
 		Event:        protocol.TopicFileComplete,
+		GroupID:      groupID,
 		Token:        token,
 		FileID:       file.ID,
 		FileName:     file.Name,

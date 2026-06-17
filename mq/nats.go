@@ -18,7 +18,25 @@ type Client struct {
 }
 
 func New(url string, logger *slog.Logger) (*Client, error) {
-	conn, err := nats.Connect(url, nats.Name("clipboard-sync-agent"))
+	conn, err := nats.Connect(url,
+		nats.Name("clipboard-sync-agent"),
+		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
+			if sub != nil {
+				logger.Error("nats async error", "subject", sub.Subject, "error", err)
+				return
+			}
+			logger.Error("nats async error", "error", err)
+		}),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			logger.Warn("nats disconnected", "error", err)
+		}),
+		nats.ReconnectHandler(func(conn *nats.Conn) {
+			logger.Info("nats reconnected", "url", conn.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			logger.Warn("nats connection closed")
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("connect nats: %w", err)
 	}
@@ -45,7 +63,7 @@ func (c *Client) Subscribe(subject string, handler Handler) error {
 	if err != nil {
 		return fmt.Errorf("subscribe %s: %w", subject, err)
 	}
-	if subject == protocol.TopicFileChunk {
+	if subject == protocol.TopicFileChunk || subject == protocol.TopicImageChunk {
 		if err := sub.SetPendingLimits(65536, 1024*1024*1024); err != nil {
 			return fmt.Errorf("set pending limits for %s: %w", subject, err)
 		}

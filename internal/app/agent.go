@@ -50,8 +50,8 @@ func NewAgent(deviceID string, cfg config.Config, clip clipboard.Clipboard, mqCl
 		logger:       logger,
 		requested:    map[string]struct{}{},
 	}
-	agent.sender = transfer.NewSender(cfg.ChunkSize, mqClient, logger, deviceID)
-	agent.imageSender = transfer.NewImageSender(cfg.ChunkSize, mqClient, deviceID)
+	agent.sender = transfer.NewSender(cfg.GroupID, cfg.ChunkSize, mqClient, logger, deviceID)
+	agent.imageSender = transfer.NewImageSender(cfg.GroupID, cfg.ChunkSize, mqClient, deviceID)
 	agent.receiver = chunk.NewReceiver(cfg.DownloadDir, agent)
 	agent.imageReceiver = chunk.NewImageReceiver(cfg.DownloadDir, agent)
 	var presenterErr error
@@ -65,6 +65,8 @@ func NewAgent(deviceID string, cfg config.Config, clip clipboard.Clipboard, mqCl
 func (a *Agent) Close() {
 	a.tokenManager.Close()
 	a.imageTokens.Close()
+	a.receiver.Close()
+	a.imageReceiver.Close()
 	if a.presenter != nil {
 		_ = a.presenter.Close()
 	}
@@ -144,7 +146,7 @@ func (a *Agent) handleLocalClipboard(ctx context.Context, data clipboard.Data) e
 }
 
 func (a *Agent) publishText(text string) error {
-	message := protocol.NewTextUpdate(a.deviceID, text)
+	message := protocol.NewTextUpdate(a.config.GroupID, a.deviceID, text)
 	if err := a.mq.Publish(protocol.TopicClipboardUpdate, message); err != nil {
 		return err
 	}
@@ -164,7 +166,7 @@ func (a *Agent) publishFiles(paths []string) error {
 	if err != nil {
 		return err
 	}
-	message := protocol.NewFileUpdate(a.deviceID, token, files)
+	message := protocol.NewFileUpdate(a.config.GroupID, a.deviceID, token, files)
 	if err := a.mq.Publish(protocol.TopicClipboardUpdate, message); err != nil {
 		return err
 	}
@@ -184,14 +186,11 @@ func (a *Agent) publishImage(image []byte, mime string) error {
 	if err != nil {
 		return err
 	}
-	message := protocol.NewImageUpdate(a.deviceID, token, meta)
+	message := protocol.NewImageUpdate(a.config.GroupID, a.deviceID, token, meta)
 	if err := a.mq.Publish(protocol.TopicClipboardUpdate, message); err != nil {
 		return err
 	}
 	if err := a.flushMQ(5 * time.Second); err != nil {
-		return err
-	}
-	if err := a.imageSender.Broadcast(token, meta, path); err != nil {
 		return err
 	}
 	a.logger.Info("clipboard image update published", "token", token, "mime", meta.MIME, "size", meta.Size)
@@ -202,6 +201,12 @@ func (a *Agent) onClipboardUpdate(_ string, payload []byte) error {
 	message, err := protocol.Decode[protocol.ClipboardUpdateMessage](payload)
 	if err != nil {
 		return err
+	}
+	if err := protocol.ValidateClipboardUpdate(message); err != nil {
+		return err
+	}
+	if message.GroupID != a.config.GroupID {
+		return nil
 	}
 	if message.DeviceID == a.deviceID {
 		return nil
@@ -232,6 +237,7 @@ func (a *Agent) applyRemoteText(text string) error {
 func (a *Agent) applyRemoteFiles(message protocol.ClipboardUpdateMessage) error {
 	state := cache.RemoteClipboardState{
 		Token:        message.Token,
+		GroupID:      message.GroupID,
 		SourceDevice: message.DeviceID,
 		Files:        message.Files,
 		CreatedAt:    message.CreatedAt,
@@ -266,7 +272,7 @@ func (a *Agent) applyRemoteImage(message protocol.ClipboardUpdateMessage) error 
 		return fmt.Errorf("remote image metadata is missing")
 	}
 	a.logger.Info("remote image metadata received", "token", message.Token, "source_device", message.DeviceID, "mime", message.Image.MIME)
-	return nil
+	return a.requestImageTransfer(message.Token, message.DeviceID)
 }
 
 func (a *Agent) onClipboardRequest(_ string, payload []byte) error {
@@ -274,8 +280,25 @@ func (a *Agent) onClipboardRequest(_ string, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := protocol.ValidateClipboardRequest(message); err != nil {
+		return err
+	}
+	if message.GroupID != a.config.GroupID {
+		return nil
+	}
 	if message.TargetDevice != a.deviceID {
 		return nil
+	}
+	if message.Type == protocol.TypeImage {
+		meta, path, ok := a.imageTokens.Lookup(message.Token)
+		if !ok {
+			return fmt.Errorf("image token expired or unknown: %s", message.Token)
+		}
+		a.logger.Info("image transfer request received", "token", message.Token, "requester", message.RequesterID)
+		if err := a.imageSender.Send(message.Token, meta, path, message.RequesterID); err != nil {
+			return err
+		}
+		return a.flushMQ(10 * time.Second)
 	}
 	files, ok := a.tokenManager.Lookup(message.Token)
 	if ok {
@@ -289,6 +312,12 @@ func (a *Agent) onFileChunk(_ string, payload []byte) error {
 	message, err := protocol.Decode[protocol.FileChunkMessage](payload)
 	if err != nil {
 		return err
+	}
+	if err := protocol.ValidateFileChunk(message); err != nil {
+		return err
+	}
+	if message.GroupID != a.config.GroupID {
+		return nil
 	}
 	if message.TargetDevice != a.deviceID || message.SourceDevice == a.deviceID {
 		return nil
@@ -307,6 +336,12 @@ func (a *Agent) onFileComplete(_ string, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := protocol.ValidateFileComplete(message); err != nil {
+		return err
+	}
+	if message.GroupID != a.config.GroupID {
+		return nil
+	}
 	if message.TargetDevice != a.deviceID || message.SourceDevice == a.deviceID {
 		return nil
 	}
@@ -319,10 +354,16 @@ func (a *Agent) onImageChunk(_ string, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := protocol.ValidateImageChunk(message); err != nil {
+		return err
+	}
+	if message.GroupID != a.config.GroupID {
+		return nil
+	}
 	if message.SourceDevice == a.deviceID {
 		return nil
 	}
-	if message.TargetDevice != "" && message.TargetDevice != a.deviceID {
+	if message.TargetDevice != a.deviceID {
 		return nil
 	}
 	if message.Seq == 1 {
@@ -336,10 +377,16 @@ func (a *Agent) onImageComplete(_ string, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	if err := protocol.ValidateImageComplete(message); err != nil {
+		return err
+	}
+	if message.GroupID != a.config.GroupID {
+		return nil
+	}
 	if message.SourceDevice == a.deviceID {
 		return nil
 	}
-	if message.TargetDevice != "" && message.TargetDevice != a.deviceID {
+	if message.TargetDevice != a.deviceID {
 		return nil
 	}
 	a.logger.Info("remote image complete received", "token", message.Token, "source_device", message.SourceDevice, "mime", message.Image.MIME, "size", message.Image.Size, "total_chunks", message.TotalChunks)
@@ -356,8 +403,12 @@ func (a *Agent) RequestRemotePaste(ctx context.Context, timeout time.Duration) e
 		return fmt.Errorf("clipboard does not contain remote files")
 	}
 	marker := current.RemoteMarker
+	if marker.GroupID != "" && marker.GroupID != a.config.GroupID {
+		return fmt.Errorf("remote clipboard group mismatch: %s", marker.GroupID)
+	}
 	state := cache.RemoteClipboardState{
 		Token:        marker.Token,
+		GroupID:      marker.GroupID,
 		SourceDevice: marker.SourceDevice,
 		Files:        marker.Files,
 		CreatedAt:    marker.CreatedAt,
@@ -366,7 +417,7 @@ func (a *Agent) RequestRemotePaste(ctx context.Context, timeout time.Duration) e
 	if err := a.store.SaveTransferState(state); err != nil {
 		return err
 	}
-	request := protocol.NewRequest(marker.Token, marker.SourceDevice, a.deviceID)
+	request := protocol.NewRequest(a.config.GroupID, marker.Token, protocol.TypeFile, marker.SourceDevice, a.deviceID)
 	if err := a.mq.Publish(protocol.TopicClipboardRequest, request); err != nil {
 		return err
 	}
@@ -413,7 +464,7 @@ func (a *Agent) EnsureRemoteTransfer(state cache.RemoteClipboardState) error {
 	if err := a.store.SaveTransferState(state); err != nil {
 		return err
 	}
-	request := protocol.NewRequest(state.Token, state.SourceDevice, a.deviceID)
+	request := protocol.NewRequest(a.config.GroupID, state.Token, protocol.TypeFile, state.SourceDevice, a.deviceID)
 	if err := a.mq.Publish(protocol.TopicClipboardRequest, request); err != nil {
 		return err
 	}
@@ -438,6 +489,25 @@ func (a *Agent) ReadRemoteFile(state cache.RemoteClipboardState, file protocol.F
 		return nil, err
 	}
 	return chunk, nil
+}
+
+func (a *Agent) requestImageTransfer(token string, sourceDevice string) error {
+	a.mu.Lock()
+	if _, ok := a.requested[token]; ok {
+		a.mu.Unlock()
+		return nil
+	}
+	a.requested[token] = struct{}{}
+	a.mu.Unlock()
+	request := protocol.NewRequest(a.config.GroupID, token, protocol.TypeImage, sourceDevice, a.deviceID)
+	if err := a.mq.Publish(protocol.TopicClipboardRequest, request); err != nil {
+		return err
+	}
+	if err := a.flushMQ(5 * time.Second); err != nil {
+		return err
+	}
+	a.logger.Info("remote image transfer requested", "token", token, "source_device", sourceDevice)
+	return nil
 }
 
 func (a *Agent) OnFileCompleted(file chunk.CompletedFile) error {
@@ -511,6 +581,7 @@ func (a *Agent) presentRemoteFiles(state cache.RemoteClipboardState) (presenter.
 	if a.presenter == nil {
 		marker := protocol.RemoteClipboardMarker{
 			Token:        state.Token,
+			GroupID:      a.config.GroupID,
 			SourceDevice: state.SourceDevice,
 			Files:        state.Files,
 			CreatedAt:    state.CreatedAt,
@@ -530,6 +601,7 @@ func (a *Agent) presentRemoteFiles(state cache.RemoteClipboardState) (presenter.
 	}
 	marker := protocol.RemoteClipboardMarker{
 		Token:        state.Token,
+		GroupID:      a.config.GroupID,
 		SourceDevice: state.SourceDevice,
 		Files:        state.Files,
 		CreatedAt:    state.CreatedAt,

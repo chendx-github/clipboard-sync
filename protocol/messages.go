@@ -40,6 +40,7 @@ type ImageMeta struct {
 
 type ClipboardUpdateMessage struct {
 	Event      string     `json:"event"`
+	GroupID    string     `json:"group_id"`
 	DeviceID   string     `json:"device_id"`
 	Type       string     `json:"type"`
 	Text       string     `json:"text,omitempty"`
@@ -52,7 +53,9 @@ type ClipboardUpdateMessage struct {
 
 type ClipboardRequestMessage struct {
 	Event        string `json:"event"`
+	GroupID      string `json:"group_id"`
 	Token        string `json:"token"`
+	Type         string `json:"type"`
 	TargetDevice string `json:"target_device"`
 	RequesterID  string `json:"requester_id"`
 	RequestedAt  int64  `json:"requested_at"`
@@ -60,6 +63,7 @@ type ClipboardRequestMessage struct {
 
 type FileChunkMessage struct {
 	Event        string `json:"event"`
+	GroupID      string `json:"group_id"`
 	Token        string `json:"token"`
 	FileID       string `json:"file_id"`
 	FileName     string `json:"file_name"`
@@ -74,6 +78,7 @@ type FileChunkMessage struct {
 
 type FileCompleteMessage struct {
 	Event        string `json:"event"`
+	GroupID      string `json:"group_id"`
 	Token        string `json:"token"`
 	FileID       string `json:"file_id"`
 	FileName     string `json:"file_name"`
@@ -87,6 +92,7 @@ type FileCompleteMessage struct {
 
 type ImageChunkMessage struct {
 	Event        string `json:"event"`
+	GroupID      string `json:"group_id"`
 	Token        string `json:"token"`
 	SourceDevice string `json:"source_device"`
 	TargetDevice string `json:"target_device,omitempty"`
@@ -99,6 +105,7 @@ type ImageChunkMessage struct {
 
 type ImageCompleteMessage struct {
 	Event        string    `json:"event"`
+	GroupID      string    `json:"group_id"`
 	Token        string    `json:"token"`
 	SourceDevice string    `json:"source_device"`
 	TargetDevice string    `json:"target_device,omitempty"`
@@ -109,6 +116,7 @@ type ImageCompleteMessage struct {
 
 type RemoteClipboardMarker struct {
 	Token        string     `json:"token"`
+	GroupID      string     `json:"group_id"`
 	SourceDevice string     `json:"source_device"`
 	Files        []FileMeta `json:"files"`
 	CreatedAt    int64      `json:"created_at"`
@@ -124,9 +132,10 @@ func Decode[T any](payload []byte) (T, error) {
 	return result, err
 }
 
-func NewTextUpdate(deviceID string, text string) ClipboardUpdateMessage {
+func NewTextUpdate(groupID string, deviceID string, text string) ClipboardUpdateMessage {
 	return ClipboardUpdateMessage{
 		Event:     TopicClipboardUpdate,
+		GroupID:   groupID,
 		DeviceID:  deviceID,
 		Type:      TypeText,
 		Text:      text,
@@ -134,9 +143,10 @@ func NewTextUpdate(deviceID string, text string) ClipboardUpdateMessage {
 	}
 }
 
-func NewFileUpdate(deviceID string, token string, files []FileMeta) ClipboardUpdateMessage {
+func NewFileUpdate(groupID string, deviceID string, token string, files []FileMeta) ClipboardUpdateMessage {
 	return ClipboardUpdateMessage{
 		Event:     TopicClipboardUpdate,
+		GroupID:   groupID,
 		DeviceID:  deviceID,
 		Type:      TypeFile,
 		Files:     files,
@@ -145,9 +155,10 @@ func NewFileUpdate(deviceID string, token string, files []FileMeta) ClipboardUpd
 	}
 }
 
-func NewImageUpdate(deviceID string, token string, image ImageMeta) ClipboardUpdateMessage {
+func NewImageUpdate(groupID string, deviceID string, token string, image ImageMeta) ClipboardUpdateMessage {
 	return ClipboardUpdateMessage{
 		Event:     TopicClipboardUpdate,
+		GroupID:   groupID,
 		DeviceID:  deviceID,
 		Type:      TypeImage,
 		Image:     &image,
@@ -156,10 +167,12 @@ func NewImageUpdate(deviceID string, token string, image ImageMeta) ClipboardUpd
 	}
 }
 
-func NewRequest(token string, targetDevice string, requesterID string) ClipboardRequestMessage {
+func NewRequest(groupID string, token string, dataType string, targetDevice string, requesterID string) ClipboardRequestMessage {
 	return ClipboardRequestMessage{
 		Event:        TopicClipboardRequest,
+		GroupID:      groupID,
 		Token:        token,
+		Type:         dataType,
 		TargetDevice: targetDevice,
 		RequesterID:  requesterID,
 		RequestedAt:  time.Now().Unix(),
@@ -194,4 +207,118 @@ func ValidateFileMeta(meta FileMeta) error {
 		return fmt.Errorf("file size is invalid")
 	}
 	return nil
+}
+
+func ValidateClipboardUpdate(message ClipboardUpdateMessage) error {
+	if message.Event != TopicClipboardUpdate {
+		return fmt.Errorf("invalid clipboard update event: %s", message.Event)
+	}
+	if message.GroupID == "" {
+		return fmt.Errorf("clipboard update group_id is empty")
+	}
+	if message.DeviceID == "" {
+		return fmt.Errorf("clipboard update device_id is empty")
+	}
+	switch message.Type {
+	case TypeText:
+		return nil
+	case TypeFile:
+		if message.Token == "" {
+			return fmt.Errorf("file update token is empty")
+		}
+		if len(message.Files) == 0 {
+			return fmt.Errorf("file update files are empty")
+		}
+		for _, file := range message.Files {
+			if err := ValidateFileMeta(file); err != nil {
+				return err
+			}
+		}
+		return nil
+	case TypeImage:
+		if message.Token == "" {
+			return fmt.Errorf("image update token is empty")
+		}
+		if message.Image == nil {
+			return fmt.Errorf("image update metadata is missing")
+		}
+		return ValidateImageMeta(*message.Image)
+	default:
+		return fmt.Errorf("unknown clipboard update type: %s", message.Type)
+	}
+}
+
+func ValidateClipboardRequest(message ClipboardRequestMessage) error {
+	if message.Event != TopicClipboardRequest {
+		return fmt.Errorf("invalid clipboard request event: %s", message.Event)
+	}
+	if message.GroupID == "" || message.Token == "" || message.TargetDevice == "" || message.RequesterID == "" {
+		return fmt.Errorf("clipboard request missing required routing fields")
+	}
+	if message.Type != TypeFile && message.Type != TypeImage {
+		return fmt.Errorf("invalid clipboard request type: %s", message.Type)
+	}
+	return nil
+}
+
+func ValidateFileChunk(message FileChunkMessage) error {
+	if message.Event != TopicFileChunk {
+		return fmt.Errorf("invalid file chunk event: %s", message.Event)
+	}
+	if message.GroupID == "" || message.Token == "" || message.FileID == "" || message.FileName == "" || message.SourceDevice == "" || message.TargetDevice == "" {
+		return fmt.Errorf("file chunk missing required routing fields")
+	}
+	if message.Seq < 1 || message.Total < 1 || message.Seq > message.Total || message.Size < 0 || message.Data == "" {
+		return fmt.Errorf("invalid file chunk sequence or size")
+	}
+	return nil
+}
+
+func ValidateFileComplete(message FileCompleteMessage) error {
+	if message.Event != TopicFileComplete {
+		return fmt.Errorf("invalid file complete event: %s", message.Event)
+	}
+	if message.GroupID == "" || message.Token == "" || message.FileID == "" || message.FileName == "" || message.SourceDevice == "" || message.TargetDevice == "" || message.SHA256 == "" {
+		return fmt.Errorf("file complete missing required routing fields")
+	}
+	if message.TotalChunks < 0 || message.Size < 0 {
+		return fmt.Errorf("invalid file complete size")
+	}
+	return nil
+}
+
+func ValidateImageMeta(meta ImageMeta) error {
+	if meta.Name == "" || meta.MIME == "" || meta.SHA256 == "" {
+		return fmt.Errorf("image metadata missing required fields")
+	}
+	if meta.Size < 0 {
+		return fmt.Errorf("image size is invalid")
+	}
+	return nil
+}
+
+func ValidateImageChunk(message ImageChunkMessage) error {
+	if message.Event != TopicImageChunk {
+		return fmt.Errorf("invalid image chunk event: %s", message.Event)
+	}
+	if message.GroupID == "" || message.Token == "" || message.SourceDevice == "" || message.TargetDevice == "" {
+		return fmt.Errorf("image chunk missing required routing fields")
+	}
+	if message.Seq < 1 || message.Total < 1 || message.Seq > message.Total || message.Size < 0 || message.Data == "" {
+		return fmt.Errorf("invalid image chunk sequence or size")
+	}
+	return nil
+}
+
+func ValidateImageComplete(message ImageCompleteMessage) error {
+	if message.Event != TopicImageComplete {
+		return fmt.Errorf("invalid image complete event: %s", message.Event)
+	}
+	if message.GroupID == "" || message.Token == "" || message.SourceDevice == "" || message.TargetDevice == "" {
+		return fmt.Errorf("image complete missing required routing fields")
+	}
+	if message.TotalChunks < 1 {
+		return fmt.Errorf("invalid image complete chunk count")
+	}
+	return ValidateImageMeta(message.Image)
 }

@@ -16,6 +16,7 @@ import (
 )
 
 type Sender struct {
+	groupID   string
 	chunkSize int
 	mq        *mq.Client
 	logger    *slog.Logger
@@ -30,8 +31,8 @@ const (
 	minFileChunkPayload  = 64 * 1024
 )
 
-func NewSender(chunkSize int, client *mq.Client, logger *slog.Logger, deviceID string) *Sender {
-	return &Sender{chunkSize: chunkSize, mq: client, logger: logger, deviceID: deviceID}
+func NewSender(groupID string, chunkSize int, client *mq.Client, logger *slog.Logger, deviceID string) *Sender {
+	return &Sender{groupID: groupID, chunkSize: chunkSize, mq: client, logger: logger, deviceID: deviceID}
 }
 
 func (s *Sender) SendFiles(ctx context.Context, token string, files []protocol.FileMeta, targetDevice string) error {
@@ -70,7 +71,7 @@ func (s *Sender) sendSingleFile(ctx context.Context, token string, file protocol
 				return fmt.Errorf("hash file %s: %w", file.Path, err)
 			}
 			payload := base64.StdEncoding.EncodeToString(buffer[:n])
-			chunkMessage := NewChunkMessage(token, file, s.deviceID, targetDevice, seq, total, payload, n)
+			chunkMessage := NewChunkMessage(s.groupID, token, file, s.deviceID, targetDevice, seq, total, payload, n)
 			if err := s.mq.Publish(protocol.TopicFileChunk, chunkMessage); err != nil {
 				return err
 			}
@@ -93,7 +94,7 @@ func (s *Sender) sendSingleFile(ctx context.Context, token string, file protocol
 		}
 	}
 	sha256Hex := hex.EncodeToString(hash.Sum(nil))
-	completeMessage := NewCompleteMessage(token, file, s.deviceID, targetDevice, total, sha256Hex)
+	completeMessage := NewCompleteMessage(s.groupID, token, file, s.deviceID, targetDevice, total, sha256Hex)
 	if err := s.mq.Publish(protocol.TopicFileComplete, completeMessage); err != nil {
 		return err
 	}

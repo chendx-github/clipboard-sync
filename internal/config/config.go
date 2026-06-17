@@ -11,6 +11,7 @@ import (
 
 type Config struct {
 	DeviceID       string `yaml:"device_id"`
+	GroupID        string `yaml:"group_id"`
 	NATSURL        string `yaml:"nats_url"`
 	ChunkSize      int    `yaml:"chunk_size"`
 	TokenTTL       int    `yaml:"token_ttl"`
@@ -41,6 +42,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.NATSURL == "" {
 		cfg.NATSURL = "nats://localhost:4222"
 	}
+	if cfg.GroupID == "" {
+		cfg.GroupID = "default"
+	}
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = 8 * 1024 * 1024
 	}
@@ -65,6 +69,9 @@ func applyDefaults(cfg *Config) {
 }
 
 func validate(cfg Config) error {
+	if cfg.GroupID == "" {
+		return fmt.Errorf("group_id must not be empty")
+	}
 	if cfg.ChunkSize < 64*1024 {
 		return fmt.Errorf("chunk_size must be >= 65536")
 	}

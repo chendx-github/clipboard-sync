@@ -106,9 +106,10 @@ func imageExtension(mime string) string {
 	}
 }
 
-func NewImageChunkMessage(token string, sourceDevice string, targetDevice string, seq int, total int, data []byte) protocol.ImageChunkMessage {
+func NewImageChunkMessage(groupID string, token string, sourceDevice string, targetDevice string, seq int, total int, data []byte) protocol.ImageChunkMessage {
 	return protocol.ImageChunkMessage{
 		Event:        protocol.TopicImageChunk,
+		GroupID:      groupID,
 		Token:        token,
 		SourceDevice: sourceDevice,
 		TargetDevice: targetDevice,
@@ -120,9 +121,10 @@ func NewImageChunkMessage(token string, sourceDevice string, targetDevice string
 	}
 }
 
-func NewImageCompleteMessage(token string, sourceDevice string, targetDevice string, image protocol.ImageMeta, totalChunks int) protocol.ImageCompleteMessage {
+func NewImageCompleteMessage(groupID string, token string, sourceDevice string, targetDevice string, image protocol.ImageMeta, totalChunks int) protocol.ImageCompleteMessage {
 	return protocol.ImageCompleteMessage{
 		Event:        protocol.TopicImageComplete,
+		GroupID:      groupID,
 		Token:        token,
 		SourceDevice: sourceDevice,
 		TargetDevice: targetDevice,
@@ -133,6 +135,7 @@ func NewImageCompleteMessage(token string, sourceDevice string, targetDevice str
 }
 
 type ImageSender struct {
+	groupID   string
 	chunkSize int
 	publisher publisher
 	deviceID  string
@@ -142,8 +145,8 @@ type publisher interface {
 	Publish(subject string, message any) error
 }
 
-func NewImageSender(chunkSize int, publisher publisher, deviceID string) *ImageSender {
-	return &ImageSender{chunkSize: chunkSize, publisher: publisher, deviceID: deviceID}
+func NewImageSender(groupID string, chunkSize int, publisher publisher, deviceID string) *ImageSender {
+	return &ImageSender{groupID: groupID, chunkSize: chunkSize, publisher: publisher, deviceID: deviceID}
 }
 
 func (s *ImageSender) Send(token string, meta protocol.ImageMeta, path string, targetDevice string) error {
@@ -152,13 +155,17 @@ func (s *ImageSender) Send(token string, meta protocol.ImageMeta, path string, t
 		return fmt.Errorf("open image %s: %w", path, err)
 	}
 	defer handle.Close()
-	buffer := make([]byte, s.chunkSize)
-	total := ChunkTotal(meta.Size, s.chunkSize)
+	chunkSize := s.chunkSize
+	if chunkSize <= 0 {
+		chunkSize = 64 * 1024
+	}
+	buffer := make([]byte, chunkSize)
+	total := ChunkTotal(meta.Size, chunkSize)
 	seq := 1
 	for {
 		n, readErr := handle.Read(buffer)
 		if n > 0 {
-			msg := NewImageChunkMessage(token, s.deviceID, targetDevice, seq, total, buffer[:n])
+			msg := NewImageChunkMessage(s.groupID, token, s.deviceID, targetDevice, seq, total, buffer[:n])
 			if err := s.publisher.Publish(protocol.TopicImageChunk, msg); err != nil {
 				return err
 			}
@@ -171,9 +178,5 @@ func (s *ImageSender) Send(token string, meta protocol.ImageMeta, path string, t
 			return fmt.Errorf("read image %s: %w", path, readErr)
 		}
 	}
-	return s.publisher.Publish(protocol.TopicImageComplete, NewImageCompleteMessage(token, s.deviceID, targetDevice, meta, total))
-}
-
-func (s *ImageSender) Broadcast(token string, meta protocol.ImageMeta, path string) error {
-	return s.Send(token, meta, path, "")
+	return s.publisher.Publish(protocol.TopicImageComplete, NewImageCompleteMessage(s.groupID, token, s.deviceID, targetDevice, meta, total))
 }
