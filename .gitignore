@@ -3,6 +3,5 @@
 /dist/
 *.log
 downloads/
-/cache/
 tmp/
 clipboard-sync.zip
