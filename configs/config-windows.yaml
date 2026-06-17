@@ -7,4 +7,4 @@ poll_interval_ms: 500
 cache_dir: ""
 download_dir: ""
 mount_dir: ""
-log_level: "info"
+log_level: "error"

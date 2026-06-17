@@ -1,6 +1,6 @@
 # clipboard-sync
 
-基于 Go + NATS + JSON + YAML 的跨平台剪切板同步系统，用于在 Linux 和 Windows 之间同步文本与文件剪切板。
+基于 Go + NATS + JSON + YAML 的跨平台剪切板同步系统，用于在 Linux 和 Windows 之间同步文本、图片与文件剪切板。
 
 文件同步遵循以下原则：
 
@@ -9,17 +9,21 @@
 - 所有控制消息和文件分块都只通过 NATS 传输
 - Linux 使用 `FUSE` 虚拟文件目录承接文件管理器原生粘贴
 - Windows 使用 Explorer 原生虚拟文件剪贴板承接资源管理器原生粘贴
+- 多客户端通过 `group_id` 分组，同组广播剪切板元数据，文件/图片内容按目标设备一对一传输
 
 ## 功能概览
 
 - 文本剪切板实时同步
+- 图片剪切板同步
 - 文件复制时仅同步元数据
 - 文件粘贴时按需拉取内容
 - 支持大文件流式传输，不一次性加载到内存
 - 分块消息使用 `file.chunk` / `file.complete`
 - token 自动过期，默认 TTL 为 60 秒
 - 使用 `device_id` 防止循环广播
+- 使用 `group_id` 隔离不同设备组
 - 并发安全，传输过程支持重复块忽略与缺块检测
+- 默认仅输出错误日志，避免正常传输时刷屏
 
 ## 目录结构
 
@@ -65,6 +69,8 @@ clipboard-sync/
 - `clipboard.request`
 - `file.chunk`
 - `file.complete`
+- `image.chunk`
+- `image.complete`
 
 ## 环境要求
 
@@ -180,14 +186,15 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 4222
 
 ```yaml
 device_id: "device-A"
+group_id: "default"
 nats_url: "nats://localhost:4222"
-chunk_size: 1048576
+chunk_size: 8388608
 token_ttl: 60
 poll_interval_ms: 500
 cache_dir: ""
 download_dir: ""
 mount_dir: ""
-log_level: "info"
+log_level: "error"
 ```
 
 ### 配置项说明
@@ -195,12 +202,15 @@ log_level: "info"
 - `device_id`
   每台设备唯一标识，必须不同
 
+- `group_id`
+  剪切板同步分组，只有相同 `group_id` 的设备才会互相同步
+
 - `nats_url`
   NATS 服务地址，例如 `nats://192.168.1.10:4222`
 
 - `chunk_size`
   单个文件分块大小，单位字节
-  建议默认 `1048576` 即 `1MB`
+  当前建议 `8388608` 即 `8MB`，NATS 服务端需要配置足够大的 `max_payload`
 
 - `token_ttl`
   文件 token 生存时间，单位秒
@@ -224,6 +234,7 @@ log_level: "info"
 
 - `log_level`
   日志级别，可选 `debug`、`info`、`warn`、`error`
+  默认建议 `error`，仅保留错误和异常日志
 
 ### 推荐配置示例
 
@@ -231,28 +242,30 @@ Linux 设备：
 
 ```yaml
 device_id: "linux-dev"
+group_id: "default"
 nats_url: "nats://192.168.1.100:4222"
-chunk_size: 1048576
+chunk_size: 8388608
 token_ttl: 60
 poll_interval_ms: 500
 cache_dir: "/tmp/clipboard-sync/cache"
 download_dir: "/tmp/clipboard-sync/downloads"
 mount_dir: "/tmp/clipboard-sync/mount"
-log_level: "info"
+log_level: "error"
 ```
 
 Windows 设备：
 
 ```yaml
 device_id: "windows-dev"
+group_id: "default"
 nats_url: "nats://192.168.1.100:4222"
-chunk_size: 1048576
+chunk_size: 8388608
 token_ttl: 60
 poll_interval_ms: 500
 cache_dir: "C:\\Temp\\clipboard-sync\\cache"
 download_dir: "C:\\Temp\\clipboard-sync\\downloads"
 mount_dir: ""
-log_level: "info"
+log_level: "error"
 ```
 
 ## 编译
@@ -408,9 +421,18 @@ nats-server -p 4222
 3. 观察内存占用是否稳定
 4. 观察复制过程是否持续输出进度
 
+## 当前状态记录
+
+- 文本、图片、文件复制粘贴均已保持可用
+- 同组设备通过 `group_id` 接收剪切板元数据广播，不同组互相隔离
+- 文件和图片内容不会全员广播，实际传输时只发给请求粘贴/读取的目标设备
+- 文件复制只同步元数据，真实内容仍保持按需传输
+- Linux -> Windows 大文件速度可能低于 Windows -> Linux，主要受 Windows Explorer OLE 虚拟文件读取方式影响
+- 保持当前可用方案，不启用未验证的 Windows read-ahead 或通用 receiver 读句柄复用优化
+
 ## 日志说明
 
-默认日志级别为 `info`。
+默认日志级别为 `error`，正常复制和传输不输出 `info` 日志，只保留错误、异常、NATS 连接错误等关键日志。
 
 常见日志含义：
 
@@ -432,7 +454,7 @@ nats-server -p 4222
 - `file transfer completed`
   目标端完成某个文件的接收与校验
 
-建议联调时把 `log_level` 设为 `debug`。
+联调问题时可临时把 `log_level` 改为 `info` 或 `debug`，验证完成后建议恢复为 `error`。
 
 ## 常见问题
 
@@ -461,6 +483,7 @@ nats-server -p 4222
 检查：
 
 - `device_id` 是否重复
+- `group_id` 是否一致
 - `nats_url` 是否一致且可访问
 - NATS 端口是否被防火墙拦截
 - 两端日志是否有连接错误

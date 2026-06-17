@@ -64,7 +64,7 @@ func applyDefaults(cfg *Config) {
 		cfg.MountDir = filepath.Join(os.TempDir(), "clipboard-sync", "mount")
 	}
 	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
+		cfg.LogLevel = "error"
 	}
 }
 
