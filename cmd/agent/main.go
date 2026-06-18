@@ -87,7 +87,7 @@ func bootstrap(configPath string) (*app.Agent, func(), error) {
 		return nil, nil, err
 	}
 	logger := logx.New(cfg.LogLevel)
-	clip, err := clipboard.New(cfg.PollInterval())
+	clip, err := clipboard.New(cfg.PollInterval(), cfg.ClipboardFileWriter)
 	if err != nil {
 		return nil, nil, err
 	}
