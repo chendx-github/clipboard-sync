@@ -141,7 +141,7 @@ type bitmapInfoHeader struct {
 	ClrImportant  uint32
 }
 
-func New(pollInterval time.Duration, fileWriter string) (Clipboard, error) {
+func New(pollInterval time.Duration) (Clipboard, error) {
 	remoteFormatOnce.Do(func() {
 		name, _ := windows.UTF16PtrFromString("ClipboardSyncRemoteMarker")
 		ret, _, _ := procAddClipboardFormat.Call(uintptr(unsafe.Pointer(name)))
