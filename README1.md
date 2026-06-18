@@ -107,6 +107,22 @@ X11 至少需要 `xclip` 可用；Wayland 至少需要 `wl-copy` 和 `wl-paste` 
 - Explorer 作为文件粘贴目标
 - PowerShell 或 CMD 可执行 agent
 
+### Windows 环境准备
+
+PowerShell 中确认 Go：
+
+```powershell
+go version
+```
+
+确认可以连接 NATS 所在地址，例如：
+
+```powershell
+Test-NetConnection -ComputerName 127.0.0.1 -Port 4222
+```
+
+如果 NATS 在远程机器，把 `127.0.0.1` 改成对应 IP 或主机名。
+
 ## Linux 文件剪贴板后端
 
 Linux 端收到远程文件元数据后，需要把 FUSE 虚拟文件路径写入系统文件剪贴板。不同 Linux 桌面环境对文件剪贴板的接受方式不同，因此提供 `clipboard_file_writer` 配置项。
@@ -130,42 +146,6 @@ clipboard_file_writer: "native"
 - GTK helper 已嵌入到 Go 二进制中，不需要单独分发 `gtk_helper.py`。
 - 使用 `gtk` 时，运行机器必须安装 `python3-gobject` / GTK3。
 - Rocky Linux 8 / Nautilus 3.28 建议使用 `clipboard_file_writer: "gtk"`，否则可能出现元数据已收到但 Nautilus 粘贴按钮不可用的问题。
-
-## 构建说明
-
-构建维度是 `操作系统 + CPU 架构`，不是 Linux 发行版。
-
-也就是说，Rocky Linux、Ubuntu、Debian、Fedora 等 x86_64 Linux 通常可以共用同一个 `linux-amd64` 二进制。不同 Linux 平台的差异主要体现在运行时依赖和 `clipboard_file_writer` 配置上。
-
-Linux x86_64 / amd64：
-
-```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/agent-linux-amd64 ./cmd/agent
-```
-
-Linux arm64：
-
-```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o dist/agent-linux-arm64 ./cmd/agent
-```
-
-Windows x86_64 / amd64：
-
-```bash
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o dist/agent-windows-amd64.exe ./cmd/agent
-```
-
-当前机器本机构建：
-
-```bash
-CGO_ENABLED=0 go build -o agent ./cmd/agent
-```
-
-说明：
-
-- Linux 二进制使用 `CGO_ENABLED=0` 构建后，不依赖构建机 glibc 版本。
-- 运行时仍需要安装对应剪贴板工具、FUSE，以及可选 GTK 依赖。
-- 如果要发布 release，建议分别提供 `agent-linux-amd64`、`agent-linux-arm64`、`agent-windows-amd64.exe`。
 
 ## 配置文件
 
