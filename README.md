@@ -92,6 +92,8 @@ clipboard-sync/
 - X11：使用 `xclip`
 - Wayland：使用 `wl-copy` / `wl-paste`
 
+部分旧版 GNOME / Nautilus 环境（例如 Rocky Linux 8 / Nautilus 3.28）可能无法识别 `xclip` 写入的文件剪贴板。此时可以启用可选的 GTK 文件剪贴板后端，见 `clipboard_file_writer` 配置项。
+
 ### Windows 要求
 
 - Windows 10 / Windows 11
@@ -157,6 +159,20 @@ which wl-paste
 which fusermount3
 ```
 
+如果需要启用 GTK 文件剪贴板后端，还需要安装 GTK Python 绑定：
+
+Debian / Ubuntu：
+
+```bash
+sudo apt-get install -y python3-gi gir1.2-gtk-3.0
+```
+
+Rocky / RHEL / CentOS：
+
+```bash
+sudo dnf install -y python3-gobject gtk3
+```
+
 ### 4. Windows 环境准备
 
 PowerShell 中确认 Go：
@@ -195,6 +211,7 @@ cache_dir: ""
 download_dir: ""
 mount_dir: ""
 log_level: "error"
+clipboard_file_writer: "native"
 ```
 
 ### 配置项说明
@@ -236,6 +253,18 @@ log_level: "error"
   日志级别，可选 `debug`、`info`、`warn`、`error`
   默认建议 `error`，仅保留错误和异常日志
 
+- `clipboard_file_writer`
+  Linux 文件剪贴板写入后端，可选 `native`、`gtk`、`auto`
+  留空或 `native` 时保持原有 `xclip` / `wl-clipboard` 行为
+  `gtk` 用于兼容旧版 GNOME / Nautilus 文件粘贴
+  `auto` 会优先尝试 GTK 后端，不可用时回退原生后端
+
+GTK 后端配置示例：
+
+```yaml
+clipboard_file_writer: "gtk"
+```
+
 ### 推荐配置示例
 
 Linux 设备：
@@ -251,6 +280,7 @@ cache_dir: "/tmp/clipboard-sync/cache"
 download_dir: "/tmp/clipboard-sync/downloads"
 mount_dir: "/tmp/clipboard-sync/mount"
 log_level: "error"
+clipboard_file_writer: "native"
 ```
 
 Windows 设备：
@@ -312,6 +342,8 @@ netstat -ano | findstr 4222
 ## 运行方式
 
 ### Linux 运行
+
+Linux agent 应以当前桌面用户身份运行，不建议用 root 运行。否则可能无法访问当前用户的 X11 / Wayland 剪贴板，或导致 FUSE 挂载权限不正确。
 
 启动 agent：
 
@@ -495,6 +527,8 @@ Linux 检查：
 - 是否是在文件管理器中粘贴，而不是纯文本输入框
 - FUSE 挂载是否成功
 - 剪切板里是否已变成虚拟文件路径
+- 如果是 Rocky Linux 8 / Nautilus 3.28 等旧版 GNOME 环境，可在配置中启用 `clipboard_file_writer: "gtk"`
+- 使用 GTK 后端时，确认已安装 `python3-gobject` / GTK3，并且 agent 是以桌面用户身份运行
 
 Windows 检查：
 

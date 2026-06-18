@@ -10,16 +10,17 @@ import (
 )
 
 type Config struct {
-	DeviceID       string `yaml:"device_id"`
-	GroupID        string `yaml:"group_id"`
-	NATSURL        string `yaml:"nats_url"`
-	ChunkSize      int    `yaml:"chunk_size"`
-	TokenTTL       int    `yaml:"token_ttl"`
-	PollIntervalMS int    `yaml:"poll_interval_ms"`
-	CacheDir       string `yaml:"cache_dir"`
-	DownloadDir    string `yaml:"download_dir"`
-	MountDir       string `yaml:"mount_dir"`
-	LogLevel       string `yaml:"log_level"`
+	DeviceID            string `yaml:"device_id"`
+	GroupID             string `yaml:"group_id"`
+	NATSURL             string `yaml:"nats_url"`
+	ChunkSize           int    `yaml:"chunk_size"`
+	TokenTTL            int    `yaml:"token_ttl"`
+	PollIntervalMS      int    `yaml:"poll_interval_ms"`
+	CacheDir            string `yaml:"cache_dir"`
+	DownloadDir         string `yaml:"download_dir"`
+	MountDir            string `yaml:"mount_dir"`
+	LogLevel            string `yaml:"log_level"`
+	ClipboardFileWriter string `yaml:"clipboard_file_writer"`
 }
 
 func Load(path string) (Config, error) {
@@ -80,6 +81,11 @@ func validate(cfg Config) error {
 	}
 	if cfg.PollIntervalMS < 100 {
 		return fmt.Errorf("poll_interval_ms must be >= 100")
+	}
+	switch cfg.ClipboardFileWriter {
+	case "", "native", "gtk", "auto":
+	default:
+		return fmt.Errorf("clipboard_file_writer must be one of: native, gtk, auto")
 	}
 	return nil
 }
