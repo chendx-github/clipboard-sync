@@ -4,6 +4,7 @@ package presenter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,24 +34,14 @@ func New(root string, accessor TransferAccessor) (Presenter, error) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, fmt.Errorf("create mount dir: %w", err)
 	}
-	conn, err := fuse.Mount(
-		root,
-		fuse.FSName("clipboard-sync"),
-		fuse.Subtype("clipboard-sync"),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("mount fuse: %w", err)
-	}
 	p := &linuxPresenter{
 		root:     root,
 		accessor: accessor,
-		conn:     conn,
 		names:    make(map[string]protocol.FileMeta),
 	}
-	go func() {
-		_ = fs.Serve(conn, p)
-	}()
-	time.Sleep(150 * time.Millisecond)
+	if err := p.remount(); err != nil {
+		return nil, err
+	}
 	return p, nil
 }
 
@@ -59,6 +50,9 @@ func (p *linuxPresenter) Root() (fs.Node, error) {
 }
 
 func (p *linuxPresenter) PresentRemoteFiles(state cache.RemoteClipboardState) (Presentation, error) {
+	if err := p.ensureMounted(); err != nil {
+		return Presentation{}, err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.state = state
@@ -100,6 +94,61 @@ func (p *linuxPresenter) Close() error {
 	}
 	_ = fuse.Unmount(p.root)
 	return p.conn.Close()
+}
+
+func (p *linuxPresenter) ensureMounted() error {
+	if _, err := os.ReadDir(p.root); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.ENOTCONN) {
+		return fmt.Errorf("check mount dir %s: %w", p.root, err)
+	}
+	if err := p.remount(); err != nil {
+		return fmt.Errorf("recover broken fuse mount %s: %w", p.root, err)
+	}
+	return nil
+}
+
+func (p *linuxPresenter) remount() error {
+	if err := forceUnmountIfStale(p.root); err != nil {
+		return err
+	}
+	conn, err := fuse.Mount(
+		p.root,
+		fuse.FSName("clipboard-sync"),
+		fuse.Subtype("clipboard-sync"),
+	)
+	if err != nil {
+		return fmt.Errorf("mount fuse at %s: %w", p.root, err)
+	}
+	p.mu.Lock()
+	oldConn := p.conn
+	p.conn = conn
+	p.mu.Unlock()
+	if oldConn != nil {
+		_ = oldConn.Close()
+	}
+	go func() {
+		_ = fs.Serve(conn, p)
+	}()
+	time.Sleep(150 * time.Millisecond)
+	if _, err := os.ReadDir(p.root); err != nil {
+		_ = fuse.Unmount(p.root)
+		_ = conn.Close()
+		return fmt.Errorf("verify fuse mount %s: %w", p.root, err)
+	}
+	return nil
+}
+
+func forceUnmountIfStale(root string) error {
+	if _, err := os.ReadDir(root); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.ENOTCONN) {
+		return nil
+	}
+	if err := fuse.Unmount(root); err != nil {
+		return fmt.Errorf("unmount stale fuse mount %s: %w", root, err)
+	}
+	return nil
 }
 
 func (p *linuxPresenter) snapshot() (cache.RemoteClipboardState, map[string]protocol.FileMeta) {

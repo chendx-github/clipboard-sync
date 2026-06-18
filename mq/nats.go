@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"clipboard-sync/protocol"
 	"github.com/nats-io/nats.go"
@@ -20,6 +21,12 @@ type Client struct {
 func New(url string, logger *slog.Logger) (*Client, error) {
 	conn, err := nats.Connect(url,
 		nats.Name("clipboard-sync-agent"),
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
+		nats.Timeout(5*time.Second),
+		nats.PingInterval(20*time.Second),
+		nats.MaxPingsOutstanding(2),
 		nats.ErrorHandler(func(_ *nats.Conn, sub *nats.Subscription, err error) {
 			if sub != nil {
 				logger.Error("nats async error", "subject", sub.Subject, "error", err)
@@ -29,6 +36,9 @@ func New(url string, logger *slog.Logger) (*Client, error) {
 		}),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
 			logger.Warn("nats disconnected", "error", err)
+		}),
+		nats.DiscoveredServersHandler(func(conn *nats.Conn) {
+			logger.Info("nats discovered servers", "count", len(conn.Servers()))
 		}),
 		nats.ReconnectHandler(func(conn *nats.Conn) {
 			logger.Info("nats reconnected", "url", conn.ConnectedUrl())

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -115,6 +116,10 @@ func (a *Agent) subscribe() error {
 }
 
 func (a *Agent) handleLocalClipboard(ctx context.Context, data clipboard.Data) error {
+	if data.Empty() {
+		return nil
+	}
+
 	a.mu.Lock()
 	if time.Now().Before(a.suppressUntil) {
 		a.mu.Unlock()
@@ -579,6 +584,9 @@ func imageSuppressDuration(size int) time.Duration {
 
 func (a *Agent) presentRemoteFiles(state cache.RemoteClipboardState) (presenter.Presentation, error) {
 	if a.presenter == nil {
+		if runtime.GOOS == "linux" {
+			return presenter.Presentation{}, fmt.Errorf("linux remote file presenter is unavailable; restart agent and check fuse mount %s", a.config.MountDir)
+		}
 		marker := protocol.RemoteClipboardMarker{
 			Token:        state.Token,
 			GroupID:      a.config.GroupID,

@@ -285,7 +285,7 @@ func (c *windowsClipboard) Watch(out chan Data) {
 				continue
 			}
 			data, err := c.readWithShortRetry()
-			if err != nil || data.Fingerprint == "" || data.Fingerprint == c.last {
+			if err != nil || data.Empty() || data.Fingerprint == "" || data.Fingerprint == c.last {
 				continue
 			}
 			c.last = data.Fingerprint

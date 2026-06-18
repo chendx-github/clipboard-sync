@@ -26,3 +26,18 @@ type Clipboard interface {
 	Write(Data) error
 	Watch(chan Data)
 }
+
+func (d Data) Empty() bool {
+	switch d.Type {
+	case DataTypeText:
+		return d.Text == ""
+	case DataTypeFiles:
+		return len(d.Files) == 0
+	case DataTypeImage:
+		return len(d.Image) == 0
+	case DataTypeRemote:
+		return d.RemoteMarker == nil
+	default:
+		return true
+	}
+}

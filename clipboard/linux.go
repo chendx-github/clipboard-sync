@@ -100,7 +100,7 @@ func (c *linuxClipboard) Watch(out chan Data) {
 	go func() {
 		for {
 			data, err := c.Read()
-			if err == nil && data.Fingerprint != "" && data.Fingerprint != c.last {
+			if err == nil && !data.Empty() && data.Fingerprint != "" && data.Fingerprint != c.last {
 				c.last = data.Fingerprint
 				out <- data
 			}
