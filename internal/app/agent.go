@@ -35,6 +35,7 @@ type Agent struct {
 	logger        *slog.Logger
 	suppressUntil time.Time
 	mu            sync.Mutex
+	presenterMu   sync.Mutex
 	lastSeen      string
 	requested     map[string]struct{}
 }
@@ -583,10 +584,12 @@ func imageSuppressDuration(size int) time.Duration {
 }
 
 func (a *Agent) presentRemoteFiles(state cache.RemoteClipboardState) (presenter.Presentation, error) {
-	if a.presenter == nil {
+	if err := a.ensurePresenter(); err != nil {
 		if runtime.GOOS == "linux" {
-			return presenter.Presentation{}, fmt.Errorf("linux remote file presenter is unavailable; restart agent and check fuse mount %s", a.config.MountDir)
+			return presenter.Presentation{}, err
 		}
+	}
+	if a.presenter == nil {
 		marker := protocol.RemoteClipboardMarker{
 			Token:        state.Token,
 			GroupID:      a.config.GroupID,
@@ -619,4 +622,25 @@ func (a *Agent) presentRemoteFiles(state cache.RemoteClipboardState) (presenter.
 		return presenter.Presentation{}, err
 	}
 	return presenter.Presentation{Paths: []string{encoded}}, nil
+}
+
+func (a *Agent) ensurePresenter() error {
+	if a.presenter != nil {
+		return nil
+	}
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	a.presenterMu.Lock()
+	defer a.presenterMu.Unlock()
+	if a.presenter != nil {
+		return nil
+	}
+	recovered, err := presenter.New(a.config.MountDir, a)
+	if err != nil {
+		return fmt.Errorf("linux remote file presenter is unavailable; auto-recovery failed for mount %s: %w", a.config.MountDir, err)
+	}
+	a.presenter = recovered
+	a.logger.Error("linux remote file presenter recovered", "mount_dir", a.config.MountDir)
+	return nil
 }
