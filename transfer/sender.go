@@ -45,6 +45,14 @@ func (s *Sender) SendFiles(ctx context.Context, token string, files []protocol.F
 }
 
 func (s *Sender) sendSingleFile(ctx context.Context, token string, file protocol.FileMeta, targetDevice string) error {
+	info, err := os.Stat(file.Path)
+	if err != nil {
+		return fmt.Errorf("stat file %s: %w", file.Path, err)
+	}
+	if info.IsDir() {
+		logSkippedDirectory(file.Path)
+		return nil
+	}
 	handle, err := os.Open(file.Path)
 	if err != nil {
 		return fmt.Errorf("open file %s: %w", file.Path, err)
@@ -125,4 +133,8 @@ func (s *Sender) flush(ctx context.Context) error {
 	flushCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	return s.mq.Flush(flushCtx)
+}
+
+func logSkippedDirectory(path string) {
+	fmt.Printf("[clipboard-sync] skip directory path=%s\n", path)
 }

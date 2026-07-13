@@ -31,9 +31,6 @@ type linuxPresenter struct {
 }
 
 func New(root string, accessor TransferAccessor) (Presenter, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return nil, fmt.Errorf("create mount dir: %w", err)
-	}
 	p := &linuxPresenter{
 		root:     root,
 		accessor: accessor,
@@ -112,6 +109,9 @@ func (p *linuxPresenter) remount() error {
 	if err := forceUnmountIfStale(p.root); err != nil {
 		return err
 	}
+	if err := ensureMountRootDir(p.root); err != nil {
+		return err
+	}
 	conn, err := fuse.Mount(
 		p.root,
 		fuse.FSName("clipboard-sync"),
@@ -140,6 +140,11 @@ func (p *linuxPresenter) remount() error {
 }
 
 func forceUnmountIfStale(root string) error {
+	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeDir == 0 {
+		if err := os.Remove(root); err != nil {
+			return fmt.Errorf("remove non-directory mount path %s: %w", root, err)
+		}
+	}
 	if _, err := os.ReadDir(root); err == nil {
 		return nil
 	} else if !errors.Is(err, syscall.ENOTCONN) {
@@ -147,6 +152,16 @@ func forceUnmountIfStale(root string) error {
 	}
 	if err := fuse.Unmount(root); err != nil {
 		return fmt.Errorf("unmount stale fuse mount %s: %w", root, err)
+	}
+	return nil
+}
+
+func ensureMountRootDir(root string) error {
+	if err := os.RemoveAll(root); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("reset mount dir %s: %w", root, err)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return fmt.Errorf("create mount dir %s: %w", root, err)
 	}
 	return nil
 }
