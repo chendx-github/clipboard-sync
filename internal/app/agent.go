@@ -168,6 +168,9 @@ func (a *Agent) publishFiles(paths []string) error {
 	if err != nil {
 		return err
 	}
+	if len(files) == 0 {
+		return fmt.Errorf("selected paths contain no transferable files")
+	}
 	token, err := a.tokenManager.Issue(files)
 	if err != nil {
 		return err

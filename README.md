@@ -12,6 +12,9 @@
 <p align="center">
   <img src="docs/images/ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8813%E6%97%A5%2012_49_49.png" alt="clipboard-sync 跨平台剪贴板同步示意图" width="960">
 </p>
+<p align="center">
+  <img src="docs/images/ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8813%E6%97%A5%2013_11_02.png" alt="clipboard-sync 跨平台剪贴板同步示意图" width="960">
+</p>
 
 ## 为什么使用它
 

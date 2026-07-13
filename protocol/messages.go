@@ -226,6 +226,9 @@ func ValidateClipboardUpdate(message ClipboardUpdateMessage) error {
 		if message.Token == "" {
 			return fmt.Errorf("file update token is empty")
 		}
+		if len(message.Files) == 0 {
+			return fmt.Errorf("file update files are empty")
+		}
 		for _, file := range message.Files {
 			if err := ValidateFileMeta(file); err != nil {
 				return err

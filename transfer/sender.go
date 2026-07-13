@@ -50,8 +50,7 @@ func (s *Sender) sendSingleFile(ctx context.Context, token string, file protocol
 		return fmt.Errorf("stat file %s: %w", file.Path, err)
 	}
 	if info.IsDir() {
-		logSkippedDirectory(file.Path)
-		return nil
+		return fmt.Errorf("refuse to send directory metadata as a file: %s", file.Path)
 	}
 	handle, err := os.Open(file.Path)
 	if err != nil {
@@ -133,8 +132,4 @@ func (s *Sender) flush(ctx context.Context) error {
 	flushCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	return s.mq.Flush(flushCtx)
-}
-
-func logSkippedDirectory(path string) {
-	fmt.Printf("[clipboard-sync] skip directory path=%s\n", path)
 }

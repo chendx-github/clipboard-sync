@@ -157,9 +157,6 @@ func forceUnmountIfStale(root string) error {
 }
 
 func ensureMountRootDir(root string) error {
-	if err := os.RemoveAll(root); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("reset mount dir %s: %w", root, err)
-	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return fmt.Errorf("create mount dir %s: %w", root, err)
 	}
