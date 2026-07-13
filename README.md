@@ -62,6 +62,7 @@ chunk_size: 8388608
 token_ttl: 60
 poll_interval_ms: 500
 log_level: "error"
+clipboard_file_format: "uri-list" # Dolphin 使用 uri-list；Nautilus/Files 使用 gnome
 ```
 
 启动 Agent：
@@ -116,6 +117,17 @@ sequenceDiagram
 | Linux | 将远程文件映射到 FUSE 虚拟目录，并把虚拟路径写入 X11/Wayland 剪贴板。 |
 | Windows | 使用 OLE 虚拟文件剪贴板对象，供 Windows Explorer 按需读取。 |
 
+### Linux 文件管理器兼容性
+
+Linux 桌面环境对文件剪贴板使用的 MIME 类型并不完全一致。`clipboard_file_format` 用于选择 Agent 写入远程文件虚拟路径时使用的格式；一次只会提供一种格式。
+
+| 配置值 | 剪贴板 MIME | 载荷格式 | 适用文件管理器 |
+| --- | --- | --- | --- |
+| `uri-list`（默认） | `text/uri-list` | `file://` URI 列表 | Dolphin |
+| `gnome` | `x-special/gnome-copied-files` | `copy` + `file://` URI 列表 | GNOME Files / Nautilus |
+
+如果粘贴时出现“剪贴板内容的文件名”之类的提示，说明文件管理器把剪贴板载荷当作普通文本处理。将 `clipboard_file_format` 切换为与当前文件管理器对应的值，重启 Agent 后重新从另一台设备复制文件。
+
 ### NATS 主题
 
 | 主题 | 用途 |
@@ -146,16 +158,6 @@ sudo apt-get update && sudo apt-get install -y xclip fuse3
 
 # Wayland
 sudo apt-get update && sudo apt-get install -y wl-clipboard fuse3
-```
-
-可选的 GTK 文件剪贴板后端适合部分旧版 GNOME / Nautilus 环境：
-
-```bash
-# Debian / Ubuntu
-sudo apt-get install -y python3-gi gir1.2-gtk-3.0
-
-# Rocky / RHEL / CentOS
-sudo dnf install -y python3-gobject gtk3
 ```
 
 ### Windows
@@ -197,15 +199,16 @@ cache_dir: ""                                # 留空使用系统临时目录
 download_dir: ""                             # spool 和落地目录，留空使用系统临时目录
 mount_dir: ""                                # Linux FUSE 挂载目录，留空使用系统临时目录
 log_level: "error"                           # debug | info | warn | error
-clipboard_file_writer: "native"              # Linux: native | gtk | auto
+clipboard_file_format: "uri-list"            # Linux: uri-list (Dolphin) | gnome (Nautilus/Files)
 ```
 
 配置要点：
 
 - `nats_url` 必须是所有设备可访问的地址；远程 NATS 不应填写 `localhost`。
 - `chunk_size` 最低为 `65536`。默认 `8388608`，NATS 服务端的 `max_payload` 必须足够大。
-- `clipboard_file_writer: "auto"` 会优先使用 GTK 后端，失败时回退到原生 `xclip` / `wl-clipboard` 后端。
 - `cache_dir`、`download_dir` 和 `mount_dir` 在生产环境建议设置为稳定且可写的目录。
+- `clipboard_file_format` 仅影响 Linux 接收远程文件后的文件剪贴板写入。默认 `uri-list` 使用标准 `text/uri-list`，适用于 Dolphin。
+- GNOME Files/Nautilus 使用 `gnome`，其载荷为 `x-special/gnome-copied-files` 和 `copy` 操作标记。切换该配置后必须重启 Agent，并重新复制远程文件。
 
 ## 运行 NATS
 
@@ -243,8 +246,8 @@ max_payload: 16777216
 
 - 确认安装 `fuse3`，且 `mount_dir` 的父目录可写。
 - 确认在文件管理器中粘贴，而不是终端或普通文本输入框。
-- 旧版 GNOME / Nautilus 可尝试 `clipboard_file_writer: "gtk"`，并安装 GTK Python 绑定。
 - 确认 Agent 由当前桌面用户运行。
+- Dolphin 使用 `clipboard_file_format: "uri-list"`；GNOME Files/Nautilus 使用 `clipboard_file_format: "gnome"`。修改配置后重启 Agent，并重新复制远程文件。
 
 ### 两台设备没有同步
 
@@ -295,7 +298,7 @@ GOOS=windows GOARCH=amd64 go build -o agent.exe ./cmd/agent
 ## 当前限制
 
 - Linux -> Windows 的大文件吞吐可能低于 Windows -> Linux，主要受 Windows Explorer 的 OLE 虚拟文件读取方式影响。
-- Linux 文件粘贴依赖桌面环境对标准文件路径剪贴板格式的支持；旧版 GNOME / Nautilus 可能需要 GTK 后端。
+- Linux 文件剪贴板只能同时发布一种 MIME 格式；同一台设备需要在 Dolphin 与 GNOME Files/Nautilus 之间切换使用时，必须修改 `clipboard_file_format` 并重启 Agent。
 
 ## 贡献
 

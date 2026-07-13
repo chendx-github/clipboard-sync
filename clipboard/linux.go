@@ -20,7 +20,7 @@ import (
 type linuxClipboard struct {
 	pollInterval time.Duration
 	backend      linuxBackend
-	gtkWriter    *gtkFileWriter
+	fileFormat   string
 	last         string
 }
 
@@ -31,27 +31,12 @@ const (
 	backendWayland
 )
 
-func New(pollInterval time.Duration, fileWriter string) (Clipboard, error) {
+func New(pollInterval time.Duration, fileFormat string) (Clipboard, error) {
 	backend, err := detectLinuxBackend()
 	if err != nil {
 		return nil, err
 	}
-	clip := &linuxClipboard{pollInterval: pollInterval, backend: backend}
-	// Older file managers (Nautilus 3.x) only honour file paste from a
-	// GTK-owned clipboard. Optionally route file writes through a GTK helper.
-	switch fileWriter {
-	case "gtk":
-		writer, gerr := detectGTKFileWriter()
-		if gerr != nil {
-			return nil, fmt.Errorf("gtk file writer requested but unavailable: %w", gerr)
-		}
-		clip.gtkWriter = writer
-	case "auto":
-		if writer, gerr := detectGTKFileWriter(); gerr == nil {
-			clip.gtkWriter = writer
-		}
-	}
-	return clip, nil
+	return &linuxClipboard{pollInterval: pollInterval, backend: backend, fileFormat: fileFormat}, nil
 }
 
 func (c *linuxClipboard) Read() (Data, error) {
@@ -287,37 +272,34 @@ func (c *linuxClipboard) writeFiles(files []string) error {
 			return fmt.Errorf("stat %s: %w", path, err)
 		}
 	}
-	if c.gtkWriter != nil {
-		uris := make([]string, 0, len(files))
-		for _, path := range files {
-			uris = append(uris, pathToFileURI(path))
-		}
-		payload := "x-special/nautilus-clipboard\ncopy\n" + strings.Join(uris, "\n") + "\n"
-		if err := c.gtkWriter.writeFiles(payload); err != nil {
-			return fmt.Errorf("write gtk files: %w", err)
+	mime, payload := fileClipboardPayload(c.fileFormat, files)
+	if c.backend == backendWayland {
+		cmd := exec.Command("wl-copy", "--type", mime)
+		cmd.Stdin = strings.NewReader(payload)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("write file clipboard %s: %w", mime, err)
 		}
 		return nil
 	}
-	lines := make([]string, 0, len(files)+1)
-	lines = append(lines, "copy")
+	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", mime)
+	cmd.Stdin = strings.NewReader(payload)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("write file clipboard %s: %w", mime, err)
+	}
+	return nil
+}
+
+func fileClipboardPayload(fileFormat string, files []string) (string, string) {
+	lines := make([]string, 0, len(files))
 	for _, path := range files {
 		lines = append(lines, pathToFileURI(path))
 	}
-	payload := strings.Join(lines, "\n")
-	if c.backend == backendWayland {
-		cmd := exec.Command("wl-copy", "--type", "x-special/gnome-copied-files")
-		cmd.Stdin = strings.NewReader(payload)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("write gnome copied files: %w", err)
-		}
-		return nil
+	if fileFormat == "gnome" {
+		// Preserve the historical Nautilus payload exactly: unlike uri-list,
+		// the private GNOME format has no trailing newline after its last URI.
+		return "x-special/gnome-copied-files", "copy\n" + strings.Join(lines, "\n")
 	}
-	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", "x-special/gnome-copied-files")
-	cmd.Stdin = strings.NewReader(payload)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("write xclip files: %w", err)
-	}
-	return nil
+	return "text/uri-list", strings.Join(lines, "\n") + "\n"
 }
 
 func pathToFileURI(path string) string {

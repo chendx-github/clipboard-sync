@@ -20,7 +20,7 @@ type Config struct {
 	DownloadDir         string `yaml:"download_dir"`
 	MountDir            string `yaml:"mount_dir"`
 	LogLevel            string `yaml:"log_level"`
-	ClipboardFileWriter string `yaml:"clipboard_file_writer"`
+	ClipboardFileFormat string `yaml:"clipboard_file_format"`
 }
 
 func Load(path string) (Config, error) {
@@ -67,6 +67,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "error"
 	}
+	if cfg.ClipboardFileFormat == "" {
+		cfg.ClipboardFileFormat = "uri-list"
+	}
 }
 
 func validate(cfg Config) error {
@@ -82,10 +85,10 @@ func validate(cfg Config) error {
 	if cfg.PollIntervalMS < 100 {
 		return fmt.Errorf("poll_interval_ms must be >= 100")
 	}
-	switch cfg.ClipboardFileWriter {
-	case "", "native", "gtk", "auto":
+	switch cfg.ClipboardFileFormat {
+	case "uri-list", "gnome":
 	default:
-		return fmt.Errorf("clipboard_file_writer must be one of: native, gtk, auto")
+		return fmt.Errorf("clipboard_file_format must be one of: uri-list, gnome")
 	}
 	return nil
 }
