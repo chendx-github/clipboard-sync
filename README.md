@@ -1,606 +1,299 @@
 # clipboard-sync
 
-基于 Go + NATS + JSON + YAML 的跨平台剪切板同步系统，用于在 Linux 和 Windows 之间同步文本、图片与文件剪切板。
+> 面向局域网的低延迟跨平台剪贴板同步：Linux 和 Windows 间复制文本、图片与文件，文件元数据即时到达，内容在粘贴时高速按需传输。
 
-文件同步遵循以下原则：
+`clipboard-sync` 是一个以本机剪贴板体验为中心的跨平台同步 Agent。两台设备加入同一个 `group_id` 后，复制文本、图片或文件，便可在另一台设备直接粘贴。在稳定的局域网中，元数据同步近乎无感；文件内容不会在复制时预先传完，也不会被广播给所有设备。
 
-- 复制文件时只同步元数据，不传文件内容
-- 粘贴时才按需传输文件内容
-- 所有控制消息和文件分块都只通过 NATS 传输
-- Linux 使用 `FUSE` 虚拟文件目录承接文件管理器原生粘贴
-- Windows 使用 Explorer 原生虚拟文件剪贴板承接资源管理器原生粘贴
-- 多客户端通过 `group_id` 分组，同组广播剪切板元数据，文件/图片内容按目标设备一对一传输
+| Linux | Windows |
+| --- | --- |
+| X11 / Wayland 剪贴板 + FUSE 虚拟文件 | Explorer 原生虚拟文件剪贴板 |
+| 文件管理器直接 `Ctrl+V` | 资源管理器直接 `Ctrl+V` |
 
-## 功能概览
+<p align="center">
+  <img src="docs/images/ChatGPT%20Image%202026%E5%B9%B47%E6%9C%8813%E6%97%A5%2012_49_49.png" alt="clipboard-sync 跨平台剪贴板同步示意图" width="960">
+</p>
 
-- 文本剪切板实时同步
-- 图片剪切板同步
-- 文件复制时仅同步元数据
-- 文件粘贴时按需拉取内容
-- 支持大文件流式传输，不一次性加载到内存
-- 分块消息使用 `file.chunk` / `file.complete`
-- token 自动过期，默认 TTL 为 60 秒
-- 使用 `device_id` 防止循环广播
-- 使用 `group_id` 隔离不同设备组
-- 并发安全，传输过程支持重复块忽略与缺块检测
-- 默认仅输出错误日志，避免正常传输时刷屏
+## 为什么使用它
 
-## 目录结构
+- **保留原生粘贴体验**：无需先下载文件或打开专用客户端，在系统文件管理器中直接粘贴。
+- **为低延迟而设计**：复制时立即发布轻量元数据，避免大文件阻塞剪贴板同步；真正的数据只在用户粘贴时发送。
+- **按需传输**：复制阶段只传文件名、大小、校验和与访问 token；只有目标端读取文件时才传输数据。
+- **大文件同样流畅**：内容按块流式发送，目标端边接收边写入临时文件，不会一次性载入内存。
+- **局域网消息总线**：控制消息、图片数据和文件分块均经过 NATS，不依赖 HTTP、SSH 或共享目录。
+- **多设备隔离**：`group_id` 限定可互相同步的设备，`device_id` 防止本机事件回环。
 
-```text
-clipboard-sync/
-  cmd/agent/
-  internal/
-  clipboard/
-  mq/
-  protocol/
-  transfer/
-  chunk/
-  cache/
-  device/
-  configs/
+## 功能
+
+- 实时同步文本剪贴板
+- 同步图片剪贴板
+- 同步单个文件、多个文件和文件夹的元数据
+- Linux <-> Windows、Linux <-> Linux、Windows <-> Windows 文件粘贴
+- 文件内容按目标设备单播，支持重复分块忽略、缺块检测与 SHA256 校验
+- NATS 断连后自动持续重连
+- Linux FUSE 挂载异常后自动尝试恢复
+- 默认仅输出错误日志，正常运行保持安静
+
+## 快速开始
+
+准备两台可访问同一 NATS 服务的设备。下面以 Linux 为例；Windows 的构建与运行命令见[平台安装](#平台安装)。
+
+```bash
+git clone https://github.com/chendx-github/clipboard-sync.git
+cd clipboard-sync
+
+# Linux: X11 选择 xclip，Wayland 选择 wl-clipboard
+sudo apt-get update && sudo apt-get install -y xclip fuse3 nats-server
+
+go build -o agent ./cmd/agent
+nats-server -p 4222
 ```
+
+复制一份配置给每台设备，确保它们使用不同的 `device_id`、相同的 `group_id` 和可访问的 `nats_url`：
+
+```yaml
+# configs/linux.yaml
+device_id: "linux-a"
+group_id: "team-a"
+nats_url: "nats://192.168.1.100:4222"
+chunk_size: 8388608
+token_ttl: 60
+poll_interval_ms: 500
+log_level: "error"
+```
+
+启动 Agent：
+
+```bash
+./agent run -config configs/linux.yaml
+```
+
+在另一台设备完成同样配置并启动 Agent 后，复制一段文本或一个文件，再在目标设备直接粘贴即可。
+
+## 使用方式
+
+### 文本和图片
+
+1. 在设备 A 复制文本或图片。
+2. 设备 B 自动接收并写入本机剪贴板。
+3. 在任何支持的应用中粘贴。
+
+### 文件和文件夹
+
+1. 在设备 A 的文件管理器中复制文件、多个文件或文件夹。
+2. 设备 B 接收元数据，并把可读取的虚拟文件写入本机剪贴板。
+3. 在设备 B 的文件管理器或 Windows Explorer 中按 `Ctrl+V`。
+4. 文件管理器请求内容后，设备 A 才开始通过 NATS 流式发送数据。
+
+文件需要在 token 有效期内粘贴，默认有效期为 60 秒。过期后重新复制即可。
 
 ## 工作原理
 
-### 文本同步
+```mermaid
+sequenceDiagram
+    participant A as 设备 A
+    participant N as NATS
+    participant B as 设备 B
+    participant FM as 文件管理器 / Explorer
 
-1. 本地设备监听到文本剪切板变化
-2. 发布 `clipboard.update`
-3. 远端设备收到消息后直接写入本地系统剪切板
+    A->>N: clipboard.update（文件元数据 + token）
+    N->>B: clipboard.update
+    B->>B: 写入虚拟文件到系统剪贴板
+    FM->>B: 用户粘贴并读取文件
+    B->>N: clipboard.request（目标设备）
+    N->>A: clipboard.request
+    A->>N: file.chunk / file.complete
+    N->>B: file.chunk / file.complete
+    B->>FM: 边接收边提供文件内容
+```
 
-### 文件同步
+### 平台实现
 
-1. 本地复制文件
-2. agent 计算文件名、大小、SHA256，并生成 token
-3. 发布 `clipboard.update`，只包含元数据和 token
-4. 远端设备收到元数据后：
-   Linux 把文件映射到本地 FUSE 虚拟目录，并把这些虚拟文件路径写入系统剪切板
-   Windows 把文件注册成 Explorer 可读取的虚拟文件剪贴板对象
-5. 用户在文件管理器或资源管理器中直接粘贴
-6. 文件管理器开始读取文件时，agent 才发布 `clipboard.request`
-7. 源端收到请求后，通过 NATS 按块发送文件数据
-8. 目标端边接收边写 spool 文件，读侧阻塞等待所需字节到达
-9. 传输完成后校验大小与 SHA256
+| 平台 | 接收远程文件时的实现 |
+| --- | --- |
+| Linux | 将远程文件映射到 FUSE 虚拟目录，并把虚拟路径写入 X11/Wayland 剪贴板。 |
+| Windows | 使用 OLE 虚拟文件剪贴板对象，供 Windows Explorer 按需读取。 |
 
-## 消息主题
+### NATS 主题
 
-- `clipboard.update`
-- `clipboard.request`
-- `file.chunk`
-- `file.complete`
-- `image.chunk`
-- `image.complete`
+| 主题 | 用途 |
+| --- | --- |
+| `clipboard.update` | 广播文本、图片或文件元数据 |
+| `clipboard.request` | 目标端请求文件内容 |
+| `file.chunk` / `file.complete` | 单播文件数据与完成信号 |
+| `image.chunk` / `image.complete` | 单播图片数据与完成信号 |
 
-## 环境要求
+## 平台安装
 
 ### 通用要求
 
-- Go 版本：`1.22` 或更高
-- NATS Server：建议 `2.9+`
-- 两台设备网络互通，且都能访问同一个 NATS 服务地址
-- 两端系统时间尽量同步，避免定位 token 过期问题时产生歧义
+- Go `1.22+`
+- NATS Server `2.9+`
+- 两台设备网络互通，均可访问同一 NATS 地址
+- 每台设备拥有独立 `device_id`
 
-### Linux 要求
+### Linux
 
-- `xclip` 或 `wl-clipboard`
-- `fuse3`
-- 文件管理器需支持标准文件路径粘贴
-
-常见桌面环境：
-
-- X11：使用 `xclip`
-- Wayland：使用 `wl-copy` / `wl-paste`
-
-部分旧版 GNOME / Nautilus 环境（例如 Rocky Linux 8 / Nautilus 3.28）可能无法识别 `xclip` 写入的文件剪贴板。此时可以启用可选的 GTK 文件剪贴板后端，见 `clipboard_file_writer` 配置项。
-
-### Windows 要求
-
-- Windows 10 / Windows 11
-- Explorer 作为文件粘贴目标
-- PowerShell 或 CMD 可执行 agent
-
-## 环境配置
-
-### 1. 安装 Go
-
-确认 Go 可用：
-
-```bash
-go version
-```
-
-输出应不低于 `go1.22`。
-
-### 2. 安装 NATS Server
-
-如果本机已经安装：
-
-```bash
-nats-server -v
-```
-
-如果未安装，请先安装 NATS Server，并确保 `nats-server` 已加入 `PATH`。
-
-### 3. Linux 依赖安装
-
-Debian / Ubuntu：
-
-X11 环境：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y xclip fuse3
-```
-
-Wayland 环境：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y wl-clipboard fuse3
-```
-
-检查命令可用性：
-
-```bash
-which xclip
-which wl-copy
-which wl-paste
-```
-
-至少需要一组可用：
-
-- `xclip`
-- 或 `wl-copy` + `wl-paste`
-
-检查 FUSE：
-
-```bash
-which fusermount3
-```
-
-如果需要启用 GTK 文件剪贴板后端，还需要安装 GTK Python 绑定：
+Agent 必须以当前桌面用户身份运行。以 root 运行可能无法访问用户剪贴板，或导致 FUSE 权限错误。
 
 Debian / Ubuntu：
 
 ```bash
+# X11
+sudo apt-get update && sudo apt-get install -y xclip fuse3
+
+# Wayland
+sudo apt-get update && sudo apt-get install -y wl-clipboard fuse3
+```
+
+可选的 GTK 文件剪贴板后端适合部分旧版 GNOME / Nautilus 环境：
+
+```bash
+# Debian / Ubuntu
 sudo apt-get install -y python3-gi gir1.2-gtk-3.0
-```
 
-Rocky / RHEL / CentOS：
-
-```bash
+# Rocky / RHEL / CentOS
 sudo dnf install -y python3-gobject gtk3
 ```
 
-### 4. Windows 环境准备
+### Windows
 
-PowerShell 中确认 Go：
+- Windows 10 或 Windows 11
+- 在 Windows Explorer 中完成文件粘贴
+- PowerShell 或 CMD 可运行 Agent
 
-```powershell
-go version
-```
-
-确认可以连接 NATS 所在地址，例如：
+构建：
 
 ```powershell
-Test-NetConnection -ComputerName 127.0.0.1 -Port 4222
+go build -o agent.exe .\cmd\agent
 ```
 
-如果 NATS 在远程机器，把 `127.0.0.1` 改成对应 IP 或主机名。
+运行：
 
-## 配置文件
-
-示例配置见 `configs/config.yaml:1`。
-
-推荐为每台设备准备独立配置，例如：
-
-- `configs/linux.yaml`
-- `configs/windows.yaml`
-
-### 配置示例
-
-```yaml
-device_id: "device-A"
-group_id: "default"
-nats_url: "nats://localhost:4222"
-chunk_size: 8388608
-token_ttl: 60
-poll_interval_ms: 500
-cache_dir: ""
-download_dir: ""
-mount_dir: ""
-log_level: "error"
-clipboard_file_writer: "native"
+```powershell
+.\agent.exe run -config configs\config-windows.yaml
 ```
 
-### 配置项说明
-
-- `device_id`
-  每台设备唯一标识，必须不同
-
-- `group_id`
-  剪切板同步分组，只有相同 `group_id` 的设备才会互相同步
-
-- `nats_url`
-  NATS 服务地址，例如 `nats://192.168.1.10:4222`
-
-- `chunk_size`
-  单个文件分块大小，单位字节
-  当前建议 `8388608` 即 `8MB`，NATS 服务端需要配置足够大的 `max_payload`
-
-- `token_ttl`
-  文件 token 生存时间，单位秒
-  默认 `60`
-
-- `poll_interval_ms`
-  剪切板轮询间隔，单位毫秒
-  默认 `500`
-
-- `cache_dir`
-  状态缓存目录
-  留空时自动使用系统临时目录
-
-- `download_dir`
-  远程文件 spool 和落地文件目录
-  留空时自动使用系统临时目录
-
-- `mount_dir`
-  Linux FUSE 挂载目录
-  留空时自动使用系统临时目录
-
-- `log_level`
-  日志级别，可选 `debug`、`info`、`warn`、`error`
-  默认建议 `error`，仅保留错误和异常日志
-
-- `clipboard_file_writer`
-  Linux 文件剪贴板写入后端，可选 `native`、`gtk`、`auto`
-  留空或 `native` 时保持原有 `xclip` / `wl-clipboard` 行为
-  `gtk` 用于兼容旧版 GNOME / Nautilus 文件粘贴
-  `auto` 会优先尝试 GTK 后端，不可用时回退原生后端
-
-GTK 后端配置示例：
-
-```yaml
-clipboard_file_writer: "gtk"
-```
-
-### 推荐配置示例
-
-Linux 设备：
-
-```yaml
-device_id: "linux-dev"
-group_id: "default"
-nats_url: "nats://192.168.1.100:4222"
-chunk_size: 8388608
-token_ttl: 60
-poll_interval_ms: 500
-cache_dir: "/tmp/clipboard-sync/cache"
-download_dir: "/tmp/clipboard-sync/downloads"
-mount_dir: "/tmp/clipboard-sync/mount"
-log_level: "error"
-clipboard_file_writer: "native"
-```
-
-Windows 设备：
-
-```yaml
-device_id: "windows-dev"
-group_id: "default"
-nats_url: "nats://192.168.1.100:4222"
-chunk_size: 8388608
-token_ttl: 60
-poll_interval_ms: 500
-cache_dir: "C:\\Temp\\clipboard-sync\\cache"
-download_dir: "C:\\Temp\\clipboard-sync\\downloads"
-mount_dir: ""
-log_level: "error"
-```
-
-## 编译
-
-Linux 本机构建：
+从 Linux 构建 Windows 二进制：
 
 ```bash
-go build ./cmd/agent
+GOOS=windows GOARCH=amd64 go build -o agent.exe ./cmd/agent
 ```
 
-Windows 交叉编译：
+## 配置
 
-```bash
-GOOS=windows GOARCH=amd64 go build ./cmd/agent
+示例文件：[configs/config.yaml](configs/config.yaml) 和 [configs/config-windows.yaml](configs/config-windows.yaml)。不要将示例中的 `device_id` 和网络地址直接用于多台设备。
+
+```yaml
+device_id: "linux-a"                         # 每台设备唯一
+group_id: "team-a"                           # 相同分组互相同步
+nats_url: "nats://192.168.1.100:4222"        # 共享 NATS 服务
+chunk_size: 8388608                           # 8 MiB；需不大于 NATS max_payload
+token_ttl: 60                                 # 文件复制元数据有效期（秒）
+poll_interval_ms: 500                         # 剪贴板轮询间隔（毫秒）
+cache_dir: ""                                # 留空使用系统临时目录
+download_dir: ""                             # spool 和落地目录，留空使用系统临时目录
+mount_dir: ""                                # Linux FUSE 挂载目录，留空使用系统临时目录
+log_level: "error"                           # debug | info | warn | error
+clipboard_file_writer: "native"              # Linux: native | gtk | auto
 ```
 
-## 启动 NATS
+配置要点：
 
-本机启动：
+- `nats_url` 必须是所有设备可访问的地址；远程 NATS 不应填写 `localhost`。
+- `chunk_size` 最低为 `65536`。默认 `8388608`，NATS 服务端的 `max_payload` 必须足够大。
+- `clipboard_file_writer: "auto"` 会优先使用 GTK 后端，失败时回退到原生 `xclip` / `wl-clipboard` 后端。
+- `cache_dir`、`download_dir` 和 `mount_dir` 在生产环境建议设置为稳定且可写的目录。
+
+## 运行 NATS
+
+本地开发可直接启动：
 
 ```bash
 nats-server -p 4222
 ```
 
-如果要让局域网其他设备访问，确认：
+局域网使用时，开放 NATS 端口并将配置中的 `nats_url` 改为实际监听地址。使用 8 MiB 分块时，服务端配置至少应包含：
 
-- 防火墙已放通 `4222`
-- `nats_url` 指向实际可访问地址
-
-验证 NATS 端口监听：
-
-Linux：
-
-```bash
-ss -lntp | grep 4222
+```conf
+max_payload: 16777216
 ```
 
-Windows：
+## 验证清单
 
-```powershell
-netstat -ano | findstr 4222
-```
+建议按以下顺序验证部署：
 
-## 运行方式
-
-### Linux 运行
-
-Linux agent 应以当前桌面用户身份运行，不建议用 root 运行。否则可能无法访问当前用户的 X11 / Wayland 剪贴板，或导致 FUSE 挂载权限不正确。
-
-启动 agent：
-
-```bash
-go run ./cmd/agent run -config configs/config.yaml
-```
-
-或使用构建后的二进制：
-
-```bash
-./agent run -config configs/config.yaml
-```
-
-Linux 启动后行为：
-
-- 自动检测 `wl-clipboard` 或 `xclip`
-- 自动挂载 FUSE 虚拟目录
-- 监听本地剪切板变化
-- 订阅 NATS 消息
-
-### Windows 运行
-
-PowerShell 启动 agent：
-
-```powershell
-go run .\cmd\agent run -config configs\config.yaml
-```
-
-或运行构建后的可执行文件：
-
-```powershell
-.\agent.exe run -config configs\config.yaml
-```
-
-Windows 启动后行为：
-
-- 监听本地剪切板变化
-- 订阅 NATS 消息
-- 收到远程文件元数据时，将其注册为 Explorer 虚拟文件剪贴板对象
-
-## 使用方法
-
-### 文本同步
-
-1. 在设备 A 复制一段文本
-2. 设备 A 发布 `clipboard.update`
-3. 设备 B 自动收到文本并写入本地剪切板
-4. 在设备 B 直接粘贴即可
-
-### 文件同步：Linux -> Windows
-
-1. 在 Linux 设备上复制一个或多个文件
-2. Linux agent 计算元数据并发布 `clipboard.update`
-3. Windows agent 收到消息后，把这些文件注册为 Explorer 虚拟文件
-4. 在 Windows 资源管理器中打开目标目录，直接按 `Ctrl+V`
-5. 资源管理器会显示原生复制进度框
-6. 真正读取文件内容时，Windows agent 才发起 `clipboard.request`
-7. Linux 端开始通过 NATS 分块发送文件内容
-
-### 文件同步：Windows -> Linux
-
-1. 在 Windows 设备上复制一个或多个文件
-2. Windows agent 计算元数据并发布 `clipboard.update`
-3. Linux agent 收到消息后，把这些文件映射到 FUSE 虚拟目录，并把这些路径写入系统剪切板
-4. 在 Linux 文件管理器中打开目标目录，直接按 `Ctrl+V`
-5. 文件管理器会显示原生复制进度
-6. 真正读取文件内容时，Linux agent 才发起 `clipboard.request`
-7. Windows 端开始通过 NATS 分块发送文件内容
-
-### 文件同步：Linux -> Linux / Windows -> Windows
-
-只要两端都运行本项目并连接同一个 NATS，也按同样方式工作。
-
-## 联调步骤
-
-建议按下面顺序验证：
-
-### 1. 单机验证 NATS
-
-启动 NATS：
-
-```bash
-nats-server -p 4222
-```
-
-启动 agent，观察日志中是否报连接错误。
-
-### 2. 文本同步验证
-
-1. 两台机器都启动 agent
-2. 在设备 A 复制文本
-3. 到设备 B 粘贴
-4. 确认文本内容一致
-
-### 3. 小文件验证
-
-1. 在设备 A 准备一个小文件，例如 `hello.txt`
-2. 复制该文件
-3. 在设备 B 的文件管理器里粘贴
-4. 确认出现原生复制进度
-5. 确认落地文件大小和内容正确
-
-### 4. 大文件验证
-
-1. 准备一个大于 `1GB` 的文件
-2. 复制并跨设备粘贴
-3. 观察内存占用是否稳定
-4. 观察复制过程是否持续输出进度
-
-## 当前状态记录
-
-- 文本、图片、文件复制粘贴均已保持可用
-- 同组设备通过 `group_id` 接收剪切板元数据广播，不同组互相隔离
-- 文件和图片内容不会全员广播，实际传输时只发给请求粘贴/读取的目标设备
-- 文件复制只同步元数据，真实内容仍保持按需传输
-- Linux -> Windows 大文件速度可能低于 Windows -> Linux，主要受 Windows Explorer OLE 虚拟文件读取方式影响
-- 保持当前可用方案，不启用未验证的 Windows read-ahead 或通用 receiver 读句柄复用优化
-
-## 日志说明
-
-默认日志级别为 `error`，正常复制和传输不输出 `info` 日志，只保留错误、异常、NATS 连接错误等关键日志。
-
-常见日志含义：
-
-- `agent started`
-  agent 启动成功
-
-- `clipboard text update published`
-  本地文本变化已广播
-
-- `clipboard file metadata published`
-  本地文件复制元数据已广播
-
-- `remote transfer requested`
-  目标端在真正读取文件时发起了内容请求
-
-- `file sent`
-  源端发送完某个文件
-
-- `file transfer completed`
-  目标端完成某个文件的接收与校验
-
-联调问题时可临时把 `log_level` 改为 `info` 或 `debug`，验证完成后建议恢复为 `error`。
+1. 两端启动 Agent，确认没有 NATS 连接错误。
+2. 复制一段文本，在另一端粘贴并核对内容。
+3. 复制图片，在另一端粘贴并核对图像。
+4. 复制一个小文件，在目标文件管理器中粘贴并核对大小与内容。
+5. 复制多个文件和一个文件夹，确认目标端可正常粘贴。
+6. 使用大文件验证磁盘空间、网络吞吐与内存占用。
 
 ## 常见问题
 
-### 1. Linux 启动时报找不到剪切板命令
+### Linux 提示找不到剪贴板命令
 
-表现：
+- X11 安装 `xclip`。
+- Wayland 安装 `wl-clipboard`，并确认 `wl-copy` / `wl-paste` 在 `PATH` 中。
 
-- 提示未找到 `xclip`
-- 或未找到 `wl-copy` / `wl-paste`
+### Linux 无法粘贴远程文件
 
-处理：
+- 确认安装 `fuse3`，且 `mount_dir` 的父目录可写。
+- 确认在文件管理器中粘贴，而不是终端或普通文本输入框。
+- 旧版 GNOME / Nautilus 可尝试 `clipboard_file_writer: "gtk"`，并安装 GTK Python 绑定。
+- 确认 Agent 由当前桌面用户运行。
 
-- X11 安装 `xclip`
-- Wayland 安装 `wl-clipboard`
+### 两台设备没有同步
 
-### 2. Linux 无法挂载 FUSE
+- 检查两端 `device_id` 不同、`group_id` 相同。
+- 检查 `nats_url` 相同且可从双方访问。
+- 检查 NATS 端口和防火墙规则。
+- 将 `log_level` 临时设置为 `info` 或 `debug`，查看连接与剪贴板事件。
 
-处理：
+### 文件复制慢或失败
 
-- 安装 `fuse3`
-- 确认系统允许当前用户使用 FUSE
-- 检查 `mount_dir` 所在目录是否可写
+- 确认 NATS 的 `max_payload` 大于 `chunk_size` 加上协议开销。
+- 使用低延迟网络部署 NATS，避免源文件位于高延迟网络盘。
+- 检查目标设备磁盘空间；接收端会先写入本地 spool 文件。
+- 复制后等待过久会使 token 过期，重新复制文件即可。
 
-### 3. 两台设备都启动了，但没有同步
+## 运维建议
 
-检查：
+- 使用 systemd 或 Windows 计划任务在用户登录后启动 Agent。
+- 为每个设备配置固定的 `device_id`，并为不同团队或环境分配不同 `group_id`。
+- 生产环境将 NATS 部署在可信网络中，并按实际需要配置网络访问控制。
+- 默认日志级别为 `error`；排障结束后恢复该级别，避免正常传输刷屏。
 
-- `device_id` 是否重复
-- `group_id` 是否一致
-- `nats_url` 是否一致且可访问
-- NATS 端口是否被防火墙拦截
-- 两端日志是否有连接错误
-
-### 4. 文件元数据同步了，但粘贴时没反应
-
-Linux 检查：
-
-- 是否是在文件管理器中粘贴，而不是纯文本输入框
-- FUSE 挂载是否成功
-- 剪切板里是否已变成虚拟文件路径
-- 如果是 Rocky Linux 8 / Nautilus 3.28 等旧版 GNOME 环境，可在配置中启用 `clipboard_file_writer: "gtk"`
-- 使用 GTK 后端时，确认已安装 `python3-gobject` / GTK3，并且 agent 是以桌面用户身份运行
-
-Windows 检查：
-
-- 是否在资源管理器中粘贴
-- 资源管理器是否为当前前台上下文
-- agent 是否正在运行且未退出
-
-### 5. 复制大文件时速度慢
-
-可以尝试：
-
-- 增大 `chunk_size`，例如改为 `4194304`
-- 保证 NATS 部署在低延迟网络中
-- 避免源文件位于高延迟网络盘
-
-### 6. token 过期
-
-如果复制后长时间未粘贴，源端 token 可能过期。
-
-处理：
-
-- 重新复制文件
-- 或增大 `token_ttl`
-
-## 生产使用建议
-
-- 为每台设备分配稳定且唯一的 `device_id`
-- 把 `nats_url` 指向固定的内网 NATS 服务
-- 把 `cache_dir`、`download_dir`、`mount_dir` 指向稳定目录
-- 大文件场景下建议监控磁盘空间，因为 spool 文件会先写本地
-- 建议用 `systemd` 或 Windows 计划任务把 agent 做成开机自启
-
-## 开机自启建议
-
-### Linux systemd
-
-可创建一个 systemd service，执行：
+Linux systemd 的服务命令示例：
 
 ```bash
 /path/to/agent run -config /path/to/config.yaml
 ```
 
-### Windows 计划任务
-
-可将下面命令配置为登录后自动启动：
+Windows 计划任务的启动命令示例：
 
 ```powershell
 C:\path\to\agent.exe run -config C:\path\to\config.yaml
 ```
 
-## 开发与验证命令
-
-格式化：
+## 开发
 
 ```bash
-gofmt -w cache chunk clipboard cmd device internal mq protocol transfer
+# 格式化
+
+# 整理依赖
+
+# 构建 Linux Agent
+
+# 交叉构建 Windows Agent
+GOOS=windows GOARCH=amd64 go build -o agent.exe ./cmd/agent
 ```
 
-整理依赖：
+## 当前限制
 
-```bash
-go mod tidy
-```
+- Linux -> Windows 的大文件吞吐可能低于 Windows -> Linux，主要受 Windows Explorer 的 OLE 虚拟文件读取方式影响。
+- Linux 文件粘贴依赖桌面环境对标准文件路径剪贴板格式的支持；旧版 GNOME / Nautilus 可能需要 GTK 后端。
 
-Linux 编译：
+## 贡献
 
-```bash
-go build ./cmd/agent
-```
-
-Windows 交叉编译：
-
-```bash
-GOOS=windows GOARCH=amd64 go build ./cmd/agent
-```
+欢迎提交 Issue 和 Pull Request。修复跨平台兼容性时，请说明操作系统版本、桌面环境、NATS 版本、复现步骤与日志级别，便于定位剪贴板和文件管理器差异。
