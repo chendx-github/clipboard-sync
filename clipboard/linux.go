@@ -20,7 +20,6 @@ import (
 type linuxClipboard struct {
 	pollInterval time.Duration
 	backend      linuxBackend
-	gtkWriter    *gtkFileWriter
 	last         string
 }
 
@@ -31,27 +30,12 @@ const (
 	backendWayland
 )
 
-func New(pollInterval time.Duration, fileWriter string) (Clipboard, error) {
+func New(pollInterval time.Duration) (Clipboard, error) {
 	backend, err := detectLinuxBackend()
 	if err != nil {
 		return nil, err
 	}
-	clip := &linuxClipboard{pollInterval: pollInterval, backend: backend}
-	// Older file managers (Nautilus 3.x) only honour file paste from a
-	// GTK-owned clipboard. Optionally route file writes through a GTK helper.
-	switch fileWriter {
-	case "gtk":
-		writer, gerr := detectGTKFileWriter()
-		if gerr != nil {
-			return nil, fmt.Errorf("gtk file writer requested but unavailable: %w", gerr)
-		}
-		clip.gtkWriter = writer
-	case "auto":
-		if writer, gerr := detectGTKFileWriter(); gerr == nil {
-			clip.gtkWriter = writer
-		}
-	}
-	return clip, nil
+	return &linuxClipboard{pollInterval: pollInterval, backend: backend}, nil
 }
 
 func (c *linuxClipboard) Read() (Data, error) {
@@ -174,9 +158,6 @@ func (c *linuxClipboard) readFileListPayload() (string, error) {
 				return string(out), nil
 			}
 		}
-		if payload, ok := c.readNautilusClipboardText(); ok {
-			return payload, nil
-		}
 		return "", errors.New("no file mime type in clipboard")
 	}
 
@@ -187,50 +168,7 @@ func (c *linuxClipboard) readFileListPayload() (string, error) {
 			return string(out), nil
 		}
 	}
-	if payload, ok := c.readNautilusClipboardText(); ok {
-		return payload, nil
-	}
 	return "", errors.New("no file payload in clipboard")
-}
-
-// readNautilusClipboardText reads a text target and returns it when it carries
-// an "x-special/" file list (the nautilus-clipboard / gnome-copied-files text
-// form). This is a fallback so that clipboards owned by GTK programs — which
-// only expose text targets — are still recognised as file lists, letting our
-// own GTK file writes round-trip back as files and avoid an echo loop.
-func (c *linuxClipboard) readNautilusClipboardText() (string, bool) {
-	var candidates []string
-	if c.backend == backendWayland {
-		mimeTypes, err := exec.Command("wl-paste", "--list-types").Output()
-		if err != nil {
-			return "", false
-		}
-		for _, target := range []string{"text/plain;charset=utf-8", "text/plain", "UTF8_STRING"} {
-			if bytes.Contains(mimeTypes, []byte(target)) {
-				candidates = append(candidates, target)
-			}
-		}
-	} else {
-		candidates = []string{"text/plain;charset=utf-8", "text/plain", "UTF8_STRING"}
-	}
-	for _, target := range candidates {
-		var (
-			out []byte
-			err error
-		)
-		if c.backend == backendWayland {
-			out, err = exec.Command("wl-paste", "--type", target, "--no-newline").Output()
-		} else {
-			out, err = exec.Command("xclip", "-selection", "clipboard", "-t", target, "-o").Output()
-		}
-		if err != nil || len(out) == 0 {
-			continue
-		}
-		if s := string(out); strings.Contains(s, "x-special/") {
-			return s, true
-		}
-	}
-	return "", false
 }
 
 func parseClipboardFileList(payload string) ([]string, error) {
@@ -286,17 +224,6 @@ func (c *linuxClipboard) writeFiles(files []string) error {
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("stat %s: %w", path, err)
 		}
-	}
-	if c.gtkWriter != nil {
-		uris := make([]string, 0, len(files))
-		for _, path := range files {
-			uris = append(uris, pathToFileURI(path))
-		}
-		payload := "x-special/nautilus-clipboard\ncopy\n" + strings.Join(uris, "\n") + "\n"
-		if err := c.gtkWriter.writeFiles(payload); err != nil {
-			return fmt.Errorf("write gtk files: %w", err)
-		}
-		return nil
 	}
 	lines := make([]string, 0, len(files)+1)
 	lines = append(lines, "copy")
