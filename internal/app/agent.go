@@ -301,7 +301,8 @@ func (a *Agent) onClipboardRequest(_ string, payload []byte) error {
 	if message.Type == protocol.TypeImage {
 		meta, path, ok := a.imageTokens.Lookup(message.Token)
 		if !ok {
-			return fmt.Errorf("image token expired or unknown: %s", message.Token)
+			a.logger.Warn("ignore image transfer request for expired or unknown token", "token", message.Token, "requester", message.RequesterID)
+			return nil
 		}
 		a.logger.Info("image transfer request received", "token", message.Token, "requester", message.RequesterID)
 		if err := a.imageSender.Send(message.Token, meta, path, message.RequesterID); err != nil {
@@ -314,7 +315,8 @@ func (a *Agent) onClipboardRequest(_ string, payload []byte) error {
 		a.logger.Info("file transfer request received", "token", message.Token, "requester", message.RequesterID)
 		return a.sender.SendFiles(context.Background(), message.Token, files, message.RequesterID)
 	}
-	return fmt.Errorf("token expired or unknown: %s", message.Token)
+	a.logger.Warn("ignore file transfer request for expired or unknown token", "token", message.Token, "requester", message.RequesterID)
+	return nil
 }
 
 func (a *Agent) onFileChunk(_ string, payload []byte) error {

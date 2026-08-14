@@ -58,8 +58,11 @@ func (c *Client) Publish(subject string, message any) error {
 	if err != nil {
 		return fmt.Errorf("encode message for %s: %w", subject, err)
 	}
+	if maxPayload := c.conn.MaxPayload(); int64(len(payload)) > maxPayload {
+		return fmt.Errorf("publish %s: payload size %d exceeds nats max payload %d", subject, len(payload), maxPayload)
+	}
 	if err := c.conn.Publish(subject, payload); err != nil {
-		return fmt.Errorf("publish %s: %w", subject, err)
+		return fmt.Errorf("publish %s (payload size %d): %w", subject, len(payload), err)
 	}
 	return nil
 }

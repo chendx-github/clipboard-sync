@@ -111,15 +111,23 @@ func (c *linuxClipboard) Watch(out chan Data) {
 }
 
 func detectLinuxBackend() (linuxBackend, error) {
-	if _, err := exec.LookPath("wl-paste"); err == nil {
-		if _, err := exec.LookPath("wl-copy"); err == nil {
-			return backendWayland, nil
+	if shouldUseWayland(os.Getenv("XDG_SESSION_TYPE"), os.Getenv("WAYLAND_DISPLAY")) {
+		if _, err := exec.LookPath("wl-paste"); err != nil {
+			return 0, fmt.Errorf("wayland clipboard backend requires wl-paste: %w", err)
 		}
+		if _, err := exec.LookPath("wl-copy"); err != nil {
+			return 0, fmt.Errorf("wayland clipboard backend requires wl-copy: %w", err)
+		}
+		return backendWayland, nil
 	}
 	if _, err := exec.LookPath("xclip"); err == nil {
 		return backendXclip, nil
 	}
-	return 0, fmt.Errorf("no clipboard backend found; install wl-clipboard or xclip")
+	return 0, fmt.Errorf("x11 clipboard backend requires xclip")
+}
+
+func shouldUseWayland(sessionType string, waylandDisplay string) bool {
+	return strings.EqualFold(sessionType, "wayland") || waylandDisplay != ""
 }
 
 func (c *linuxClipboard) readText() (string, error) {
@@ -257,8 +265,8 @@ func (c *linuxClipboard) writeText(text string) error {
 		cmd = exec.Command("xclip", "-selection", "clipboard")
 	}
 	cmd.Stdin = strings.NewReader(text)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("write clipboard text: %w", err)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("write clipboard text: %w: %s", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
