@@ -2,7 +2,13 @@
 
 package clipboard
 
-import "testing"
+import (
+	"os"
+	"os/exec"
+	"strings"
+	"testing"
+	"time"
+)
 
 func TestShouldUseWayland(t *testing.T) {
 	tests := []struct {
@@ -22,6 +28,63 @@ func TestShouldUseWayland(t *testing.T) {
 				t.Fatalf("shouldUseWayland(%q, %q) = %t, want %t", test.sessionType, test.waylandDisplay, got, test.want)
 			}
 		})
+	}
+}
+
+func TestTextFileList(t *testing.T) {
+	first := t.TempDir() + "/one.txt"
+	second := t.TempDir() + "/two.txt"
+	if err := os.WriteFile(first, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	firstURI := pathToFileURI(first)
+	secondURI := pathToFileURI(second)
+	tests := []struct {
+		name string
+		text string
+		want []string
+		ok   bool
+	}{
+		{name: "gnome copy", text: "copy\n" + firstURI + "\n" + secondURI, want: []string{first, second}, ok: true},
+		{name: "uri list", text: firstURI + "\n" + secondURI, want: []string{first, second}, ok: true},
+		{name: "ordinary text", text: "file:///tmp/one.txt is an example", ok: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := textFileList(test.text)
+			if ok != test.ok {
+				t.Fatalf("textFileList() ok = %t, want %t", ok, test.ok)
+			}
+			if strings.Join(got, "\n") != strings.Join(test.want, "\n") {
+				t.Fatalf("textFileList() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestWriteTextDoesNotWaitForXclipOwnership(t *testing.T) {
+	originalPath := os.Getenv("PATH")
+	t.Cleanup(func() { t.Setenv("PATH", originalPath) })
+
+	dir := t.TempDir()
+	path := dir + "/xclip"
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n/bin/sleep 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if _, err := exec.LookPath("xclip"); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	if err := (&linuxClipboard{backend: backendXclip}).writeText("text"); err != nil {
+		t.Fatalf("write text: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("xclip write blocked for %s", elapsed)
 	}
 }
 

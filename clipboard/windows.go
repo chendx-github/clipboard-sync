@@ -190,6 +190,19 @@ func (c *windowsClipboard) Read() (Data, error) {
 			return finish(data, nil)
 		}
 	}
+	if isClipboardFormatAvailable(cfUnicodeText) {
+		text, err := readClipboardFormat(cfUnicodeText)
+		if err == nil && text != "" {
+			if marker, ok := protocol.DecodeRemoteMarker(text); ok {
+				data := Data{Type: DataTypeRemote, Text: text, RemoteMarker: &marker}
+				data.Fingerprint = Fingerprint(data)
+				return finish(data, nil)
+			}
+			data := Data{Type: DataTypeText, Text: text}
+			data.Fingerprint = Fingerprint(data)
+			return finish(data, nil)
+		}
+	}
 	dib, err := readClipboardImageRaw()
 	if err == nil && len(dib) > 0 {
 		closeIfOpen()
@@ -714,20 +727,32 @@ func isPNGPayload(data []byte) bool {
 }
 
 func decodeClipboardImagePayload(imageBytes []byte, mime string) (image.Image, error) {
+	var lastErr error
 	if strings.EqualFold(mime, "image/bmp") {
 		img, err := bmp.Decode(bytes.NewReader(imageBytes))
 		if err == nil {
 			return img, nil
 		}
+		lastErr = err
 	}
 	img, err := png.Decode(bytes.NewReader(imageBytes))
 	if err == nil {
 		return img, nil
 	}
+	lastErr = err
 	if bmpImg, bmpErr := bmp.Decode(bytes.NewReader(imageBytes)); bmpErr == nil {
 		return bmpImg, nil
+	} else {
+		lastErr = bmpErr
 	}
-	return nil, fmt.Errorf("decode image payload: %w", err)
+	if dib, dibErr := dibToBMP(imageBytes); dibErr == nil {
+		if dibImg, bmpErr := bmp.Decode(bytes.NewReader(dib)); bmpErr == nil {
+			return dibImg, nil
+		} else {
+			lastErr = bmpErr
+		}
+	}
+	return nil, fmt.Errorf("decode image payload: %w", lastErr)
 }
 
 func readClipboardBinary(format uint32) ([]byte, error) {

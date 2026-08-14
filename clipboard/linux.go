@@ -49,6 +49,16 @@ func (c *linuxClipboard) Read() (Data, error) {
 				data.Fingerprint = Fingerprint(data)
 				return data, nil
 			}
+			if files, ok := textFileList(text); ok {
+				data := Data{Type: DataTypeFiles, Files: files}
+				data.Fingerprint = Fingerprint(data)
+				return data, nil
+			}
+			if text != "" {
+				data := Data{Type: DataTypeText, Text: text}
+				data.Fingerprint = Fingerprint(data)
+				return data, nil
+			}
 		}
 	}
 	files, err := c.readFiles()
@@ -73,6 +83,16 @@ func (c *linuxClipboard) Read() (Data, error) {
 	data := Data{Type: DataTypeText, Text: text}
 	data.Fingerprint = Fingerprint(data)
 	return data, nil
+}
+
+func textFileList(text string) ([]string, bool) {
+	firstLine, _, _ := strings.Cut(text, "\n")
+	firstLine = strings.TrimSpace(firstLine)
+	if !strings.EqualFold(firstLine, "copy") && !strings.EqualFold(firstLine, "cut") && !strings.HasPrefix(firstLine, "file://") {
+		return nil, false
+	}
+	files, err := parseClipboardFileList(text)
+	return files, err == nil && len(files) > 0
 }
 
 func (c *linuxClipboard) Write(data Data) error {
@@ -258,16 +278,20 @@ func parseClipboardFileList(payload string) ([]string, error) {
 }
 
 func (c *linuxClipboard) writeText(text string) error {
-	var cmd *exec.Cmd
 	if c.backend == backendWayland {
-		cmd = exec.Command("wl-copy")
-	} else {
-		cmd = exec.Command("xclip", "-selection", "clipboard")
+		cmd := exec.Command("wl-copy")
+		cmd.Stdin = strings.NewReader(text)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("write wayland clipboard text: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		return nil
 	}
+	cmd := exec.Command("xclip", "-selection", "clipboard")
 	cmd.Stdin = strings.NewReader(text)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("write clipboard text: %w: %s", err, strings.TrimSpace(string(output)))
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start xclip clipboard writer: %w", err)
 	}
+	go func() { _ = cmd.Wait() }()
 	return nil
 }
 
