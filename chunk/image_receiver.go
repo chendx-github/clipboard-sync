@@ -14,9 +14,10 @@ import (
 )
 
 type CompletedImage struct {
-	Token string
-	Path  string
-	Meta  protocol.ImageMeta
+	Token        string
+	Path         string
+	Meta         protocol.ImageMeta
+	SourceDevice string
 }
 
 type ImageCallback interface {
@@ -44,6 +45,7 @@ type imageSession struct {
 	lastSeen         time.Time
 	completed        bool
 	completeReceived bool
+	sourceDevice     string
 }
 
 func NewImageReceiver(root string, callback ImageCallback) *ImageReceiver {
@@ -66,7 +68,7 @@ func (r *ImageReceiver) HandleChunk(msg protocol.ImageChunkMessage) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	session, err := r.ensureSessionLocked(msg.Token)
+	session, err := r.ensureSessionLocked(msg.Token, msg.SourceDevice)
 	if err != nil {
 		return err
 	}
@@ -113,7 +115,7 @@ func (r *ImageReceiver) HandleChunk(msg protocol.ImageChunkMessage) error {
 func (r *ImageReceiver) HandleComplete(msg protocol.ImageCompleteMessage) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	session, err := r.ensureSessionLocked(msg.Token)
+	session, err := r.ensureSessionLocked(msg.Token, msg.SourceDevice)
 	if err != nil {
 		return err
 	}
@@ -146,11 +148,14 @@ func (r *ImageReceiver) finishLocked(token string, session *imageSession) error 
 	}
 	session.completed = true
 	delete(r.sessions, token)
-	return r.callback.OnImageCompleted(CompletedImage{Token: token, Path: session.path, Meta: session.meta})
+	return r.callback.OnImageCompleted(CompletedImage{Token: token, Path: session.path, Meta: session.meta, SourceDevice: session.sourceDevice})
 }
 
-func (r *ImageReceiver) ensureSessionLocked(token string) (*imageSession, error) {
+func (r *ImageReceiver) ensureSessionLocked(token string, sourceDevice string) (*imageSession, error) {
 	if session, ok := r.sessions[token]; ok {
+		if session.sourceDevice == "" {
+			session.sourceDevice = sourceDevice
+		}
 		return session, nil
 	}
 	if err := os.MkdirAll(filepath.Join(r.root, "images"), 0o755); err != nil {
@@ -161,7 +166,7 @@ func (r *ImageReceiver) ensureSessionLocked(token string) (*imageSession, error)
 	if err != nil {
 		return nil, fmt.Errorf("create image spool file: %w", err)
 	}
-	session := &imageSession{path: path, writer: writer, nextSeq: 1, pending: map[int][]byte{}, lastSeen: time.Now()}
+	session := &imageSession{path: path, writer: writer, nextSeq: 1, pending: map[int][]byte{}, lastSeen: time.Now(), sourceDevice: sourceDevice}
 	r.sessions[token] = session
 	return session, nil
 }

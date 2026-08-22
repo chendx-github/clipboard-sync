@@ -258,7 +258,10 @@ func (c *windowsClipboard) Write(data Data) error {
 
 	switch data.Type {
 	case DataTypeText:
-		return writeUnicodeText(cfUnicodeText, data.Text)
+		if err := writeUnicodeText(cfUnicodeText, data.Text); err != nil {
+			return err
+		}
+		return c.stampRemoteMarker(data)
 	case DataTypeRemote:
 		if data.RemoteMarker == nil {
 			return fmt.Errorf("remote marker is nil")
@@ -277,10 +280,40 @@ func (c *windowsClipboard) Write(data Data) error {
 	case DataTypeFiles:
 		return writeFileDropList(data.Files)
 	case DataTypeImage:
-		return writeClipboardImage(data.Image, data.ImageMIME)
+		if err := writeClipboardImage(data.Image, data.ImageMIME); err != nil {
+			return err
+		}
+		return c.stampRemoteMarker(data)
 	default:
 		return fmt.Errorf("unsupported clipboard data type: %s", data.Type)
 	}
+}
+
+// stampRemoteMarker writes the private ClipboardSyncRemoteMarker format when
+// data carries remote provenance (OriginToken/OriginDevice). Read() checks this
+// format first and returns DataTypeRemote, which the agent never re-broadcasts.
+// This makes echo suppression independent of content bytes, so it stays robust
+// against transformations such as DIB alpha loss during the image round trip.
+func (c *windowsClipboard) stampRemoteMarker(data Data) error {
+	if data.OriginToken == "" && data.OriginDevice == "" {
+		return nil
+	}
+	if remoteClipboardFormatID == 0 {
+		return nil
+	}
+	marker := protocol.RemoteClipboardMarker{
+		Token:        data.OriginToken,
+		SourceDevice: data.OriginDevice,
+		CreatedAt:    time.Now().Unix(),
+	}
+	encoded, err := protocol.EncodeRemoteMarker(marker)
+	if err != nil {
+		return fmt.Errorf("encode remote provenance marker: %w", err)
+	}
+	if err := writeUnicodeText(remoteClipboardFormatID, encoded); err != nil {
+		return fmt.Errorf("write remote provenance marker: %w", err)
+	}
+	return nil
 }
 
 func (c *windowsClipboard) Watch(out chan Data) {

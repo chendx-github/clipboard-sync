@@ -19,6 +19,14 @@ type Data struct {
 	ImageMIME    string
 	RemoteMarker *protocol.RemoteClipboardMarker
 	Fingerprint  string
+	// OriginToken and OriginDevice identify content that was written to the
+	// local clipboard by this agent after receiving it from a remote device.
+	// They are intentionally NOT part of Fingerprint (which stays content-only
+	// so Linux byte-preserving dedup keeps working). Clipboard writers use them
+	// to stamp a private provenance marker so the local watcher can recognise
+	// agent-written remote content and never re-broadcast it.
+	OriginToken  string
+	OriginDevice string
 }
 
 type Clipboard interface {

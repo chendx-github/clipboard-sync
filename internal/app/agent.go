@@ -145,6 +145,9 @@ func (a *Agent) handleLocalClipboard(ctx context.Context, data clipboard.Data) e
 		a.logger.Info("local image clipboard detected", "mime", data.ImageMIME, "size", len(data.Image))
 		return a.publishImage(data.Image, data.ImageMIME)
 	case clipboard.DataTypeRemote:
+		if data.RemoteMarker != nil {
+			a.logger.Debug("skipping remote-origin clipboard content", "source", data.RemoteMarker.SourceDevice, "token", data.RemoteMarker.Token)
+		}
 		return nil
 	default:
 		return fmt.Errorf("unsupported clipboard type: %s", data.Type)
@@ -220,9 +223,13 @@ func (a *Agent) onClipboardUpdate(_ string, payload []byte) error {
 	if message.DeviceID == a.deviceID {
 		return nil
 	}
+	if message.OriginalSource == a.deviceID {
+		a.logger.Info("ignoring echoed clipboard update from self", "type", message.Type, "token", message.Token, "device", message.DeviceID)
+		return nil
+	}
 	switch message.Type {
 	case protocol.TypeText:
-		return a.applyRemoteText(message.Text)
+		return a.applyRemoteText(message)
 	case protocol.TypeFile:
 		return a.applyRemoteFiles(message)
 	case protocol.TypeImage:
@@ -232,14 +239,22 @@ func (a *Agent) onClipboardUpdate(_ string, payload []byte) error {
 	}
 }
 
-func (a *Agent) applyRemoteText(text string) error {
-	data := clipboard.Data{Type: clipboard.DataTypeText, Text: text}
+func (a *Agent) applyRemoteText(message protocol.ClipboardUpdateMessage) error {
+	data := clipboard.Data{Type: clipboard.DataTypeText, Text: message.Text}
+	originDevice := message.OriginalSource
+	if originDevice == "" {
+		originDevice = message.DeviceID
+	}
+	if originDevice != "" {
+		data.OriginDevice = originDevice
+	}
+	data.OriginToken = message.Token
 	data.Fingerprint = clipboard.Fingerprint(data)
 	a.setSuppressFingerprint(data.Fingerprint)
 	if err := a.clipboard.Write(data); err != nil {
 		return err
 	}
-	a.logger.Info("remote text applied to clipboard")
+	a.logger.Info("remote text applied to clipboard", "from", originDevice, "token", data.OriginToken, "chars", len(message.Text))
 	return nil
 }
 
@@ -537,9 +552,11 @@ func (a *Agent) OnImageCompleted(image chunk.CompletedImage) error {
 		return fmt.Errorf("read completed image: %w", err)
 	}
 	data := clipboard.Data{Type: clipboard.DataTypeImage, Image: payload, ImageMIME: image.Meta.MIME}
+	data.OriginToken = image.Token
+	data.OriginDevice = image.SourceDevice
 	data.Fingerprint = clipboard.Fingerprint(data)
 	a.setSuppressFingerprintFor(data.Fingerprint, imageSuppressDuration(len(payload)))
-	a.logger.Info("writing remote image to clipboard", "token", image.Token, "mime", image.Meta.MIME, "size", len(payload))
+	a.logger.Info("writing remote image to clipboard", "token", image.Token, "from", image.SourceDevice, "mime", image.Meta.MIME, "size", len(payload))
 	if err := a.clipboard.Write(data); err != nil {
 		a.logger.Error("write remote image to clipboard failed", "token", image.Token, "error", err)
 		return err

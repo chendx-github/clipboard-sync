@@ -49,6 +49,10 @@ type ClipboardUpdateMessage struct {
 	Token      string     `json:"token,omitempty"`
 	CreatedAt  int64      `json:"created_at"`
 	TargetHint string     `json:"target_hint,omitempty"`
+	// OriginalSource is the device that first published this content. It is
+	// preserved on any re-broadcast so the originator can recognise and drop
+	// echoed copies of its own content (defense in depth against echo loops).
+	OriginalSource string `json:"original_source,omitempty"`
 }
 
 type ClipboardRequestMessage struct {
@@ -134,36 +138,39 @@ func Decode[T any](payload []byte) (T, error) {
 
 func NewTextUpdate(groupID string, deviceID string, text string) ClipboardUpdateMessage {
 	return ClipboardUpdateMessage{
-		Event:     TopicClipboardUpdate,
-		GroupID:   groupID,
-		DeviceID:  deviceID,
-		Type:      TypeText,
-		Text:      text,
-		CreatedAt: time.Now().Unix(),
+		Event:          TopicClipboardUpdate,
+		GroupID:        groupID,
+		DeviceID:       deviceID,
+		OriginalSource: deviceID,
+		Type:           TypeText,
+		Text:           text,
+		CreatedAt:      time.Now().Unix(),
 	}
 }
 
 func NewFileUpdate(groupID string, deviceID string, token string, files []FileMeta) ClipboardUpdateMessage {
 	return ClipboardUpdateMessage{
-		Event:     TopicClipboardUpdate,
-		GroupID:   groupID,
-		DeviceID:  deviceID,
-		Type:      TypeFile,
-		Files:     files,
-		Token:     token,
-		CreatedAt: time.Now().Unix(),
+		Event:          TopicClipboardUpdate,
+		GroupID:        groupID,
+		DeviceID:       deviceID,
+		OriginalSource: deviceID,
+		Type:           TypeFile,
+		Files:          files,
+		Token:          token,
+		CreatedAt:      time.Now().Unix(),
 	}
 }
 
 func NewImageUpdate(groupID string, deviceID string, token string, image ImageMeta) ClipboardUpdateMessage {
 	return ClipboardUpdateMessage{
-		Event:     TopicClipboardUpdate,
-		GroupID:   groupID,
-		DeviceID:  deviceID,
-		Type:      TypeImage,
-		Image:     &image,
-		Token:     token,
-		CreatedAt: time.Now().Unix(),
+		Event:          TopicClipboardUpdate,
+		GroupID:        groupID,
+		DeviceID:       deviceID,
+		OriginalSource: deviceID,
+		Type:           TypeImage,
+		Image:          &image,
+		Token:          token,
+		CreatedAt:      time.Now().Unix(),
 	}
 }
 
