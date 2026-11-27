@@ -14,6 +14,11 @@ const (
 	TopicFileComplete     = "file.complete"
 	TopicImageChunk       = "image.chunk"
 	TopicImageComplete    = "image.complete"
+	TopicTransferError    = "transfer.error"
+
+	TransferErrorTokenExpired = "token_expired"
+	TransferErrorTokenUnknown = "token_unknown"
+	TransferErrorSendFailed   = "send_failed"
 
 	TypeText  = "text"
 	TypeFile  = "file"
@@ -118,6 +123,18 @@ type ImageCompleteMessage struct {
 	CompletedAt  int64     `json:"completed_at"`
 }
 
+type TransferErrorMessage struct {
+	Event        string `json:"event"`
+	GroupID      string `json:"group_id"`
+	Token        string `json:"token"`
+	Type         string `json:"type"`
+	SourceDevice string `json:"source_device"`
+	TargetDevice string `json:"target_device"`
+	Reason       string `json:"reason"`
+	Message      string `json:"message"`
+	FailedAt     int64  `json:"failed_at"`
+}
+
 type RemoteClipboardMarker struct {
 	Token        string     `json:"token"`
 	GroupID      string     `json:"group_id"`
@@ -183,6 +200,20 @@ func NewRequest(groupID string, token string, dataType string, targetDevice stri
 		TargetDevice: targetDevice,
 		RequesterID:  requesterID,
 		RequestedAt:  time.Now().Unix(),
+	}
+}
+
+func NewTransferError(groupID string, token string, dataType string, sourceDevice string, targetDevice string, reason string, message string) TransferErrorMessage {
+	return TransferErrorMessage{
+		Event:        TopicTransferError,
+		GroupID:      groupID,
+		Token:        token,
+		Type:         dataType,
+		SourceDevice: sourceDevice,
+		TargetDevice: targetDevice,
+		Reason:       reason,
+		Message:      message,
+		FailedAt:     time.Now().Unix(),
 	}
 }
 
@@ -290,6 +321,22 @@ func ValidateFileComplete(message FileCompleteMessage) error {
 	}
 	if message.TotalChunks < 0 || message.Size < 0 {
 		return fmt.Errorf("invalid file complete size")
+	}
+	return nil
+}
+
+func ValidateTransferError(message TransferErrorMessage) error {
+	if message.Event != TopicTransferError {
+		return fmt.Errorf("invalid transfer error event: %s", message.Event)
+	}
+	if message.GroupID == "" || message.Token == "" || message.SourceDevice == "" || message.TargetDevice == "" {
+		return fmt.Errorf("transfer error missing required routing fields")
+	}
+	if message.Type != TypeFile && message.Type != TypeImage {
+		return fmt.Errorf("invalid transfer error type: %s", message.Type)
+	}
+	if message.Message == "" {
+		return fmt.Errorf("transfer error message is empty")
 	}
 	return nil
 }

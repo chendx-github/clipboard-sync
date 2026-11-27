@@ -50,3 +50,23 @@ func TestRemoteProvenanceMarkerRoundTrip(t *testing.T) {
 		t.Fatalf("provenance marker should have no files, got %+v", decoded.Files)
 	}
 }
+
+func TestValidateTransferError(t *testing.T) {
+	valid := NewTransferError("group", "token", TypeFile, "dev-a", "dev-b", TransferErrorTokenExpired, "token is gone")
+	if err := ValidateTransferError(valid); err != nil {
+		t.Fatalf("expected valid transfer error: %v", err)
+	}
+	if valid.Event != TopicTransferError || valid.Reason != TransferErrorTokenExpired {
+		t.Fatalf("unexpected transfer error payload: %+v", valid)
+	}
+	missingTarget := valid
+	missingTarget.TargetDevice = ""
+	if err := ValidateTransferError(missingTarget); err == nil {
+		t.Fatal("expected missing target_device to be rejected")
+	}
+	badType := valid
+	badType.Type = TypeText
+	if err := ValidateTransferError(badType); err == nil {
+		t.Fatal("expected unsupported type to be rejected")
+	}
+}

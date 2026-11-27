@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,6 +114,9 @@ func (a *Agent) subscribe() error {
 	if err := a.mq.Subscribe(protocol.TopicImageComplete, a.onImageComplete); err != nil {
 		return err
 	}
+	if err := a.mq.Subscribe(protocol.TopicTransferError, a.onTransferError); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -190,6 +194,10 @@ func (a *Agent) publishFiles(paths []string) error {
 }
 
 func (a *Agent) publishImage(image []byte, mime string) error {
+	if err := transfer.ValidateImagePayload(image); err != nil {
+		a.logger.Warn("skip undecodable local image clipboard payload", "mime", mime, "size", len(image), "error", err)
+		return nil
+	}
 	meta, path, err := transfer.StoreImageTemp(a.config.CacheDir, image, mime)
 	if err != nil {
 		return err
@@ -317,10 +325,12 @@ func (a *Agent) onClipboardRequest(_ string, payload []byte) error {
 		meta, path, ok := a.imageTokens.Lookup(message.Token)
 		if !ok {
 			a.logger.Warn("ignore image transfer request for expired or unknown token", "token", message.Token, "requester", message.RequesterID)
+			a.reportTransferError(message.Token, protocol.TypeImage, message.RequesterID, protocol.TransferErrorTokenExpired, "image transfer token is no longer available; copy the image again on the source device")
 			return nil
 		}
 		a.logger.Info("image transfer request received", "token", message.Token, "requester", message.RequesterID)
 		if err := a.imageSender.Send(message.Token, meta, path, message.RequesterID); err != nil {
+			a.reportTransferError(message.Token, protocol.TypeImage, message.RequesterID, protocol.TransferErrorSendFailed, err.Error())
 			return err
 		}
 		return a.flushMQ(10 * time.Second)
@@ -328,10 +338,59 @@ func (a *Agent) onClipboardRequest(_ string, payload []byte) error {
 	files, ok := a.tokenManager.Lookup(message.Token)
 	if ok {
 		a.logger.Info("file transfer request received", "token", message.Token, "requester", message.RequesterID)
-		return a.sender.SendFiles(context.Background(), message.Token, files, message.RequesterID)
+		if err := a.sender.SendFiles(context.Background(), message.Token, files, message.RequesterID); err != nil {
+			a.reportTransferError(message.Token, protocol.TypeFile, message.RequesterID, protocol.TransferErrorSendFailed, err.Error())
+			return err
+		}
+		return nil
 	}
 	a.logger.Warn("ignore file transfer request for expired or unknown token", "token", message.Token, "requester", message.RequesterID)
+	a.reportTransferError(message.Token, protocol.TypeFile, message.RequesterID, protocol.TransferErrorTokenExpired, "file transfer token is no longer available; copy the file again on the source device")
 	return nil
+}
+
+func (a *Agent) onTransferError(_ string, payload []byte) error {
+	message, err := protocol.Decode[protocol.TransferErrorMessage](payload)
+	if err != nil {
+		return err
+	}
+	if err := protocol.ValidateTransferError(message); err != nil {
+		return err
+	}
+	if message.GroupID != a.config.GroupID {
+		return nil
+	}
+	if message.TargetDevice != a.deviceID || message.SourceDevice == a.deviceID {
+		return nil
+	}
+	a.logger.Warn("remote transfer error received", "token", message.Token, "type", message.Type, "reason", message.Reason, "error", message.Message)
+	failure := fmt.Errorf("remote transfer failed (%s): %s", message.Reason, message.Message)
+	switch message.Type {
+	case protocol.TypeImage:
+		_ = a.imageReceiver.FailToken(message.Token, failure)
+	default:
+		_ = a.receiver.FailToken(message.Token, failure)
+	}
+	return nil
+}
+
+// reportTransferError tells the requesting device why a transfer cannot be
+// served, so it can fail fast instead of waiting for a timeout.
+func (a *Agent) reportTransferError(token string, dataType string, targetDevice string, reason string, detail string) {
+	message := protocol.NewTransferError(a.config.GroupID, token, dataType, a.deviceID, targetDevice, reason, detail)
+	if err := a.mq.Publish(protocol.TopicTransferError, message); err != nil {
+		a.logger.Error("publish transfer error failed", "token", token, "error", err)
+		return
+	}
+	if err := a.flushMQ(5 * time.Second); err != nil {
+		a.logger.Error("flush transfer error failed", "token", token, "error", err)
+	}
+}
+
+func (a *Agent) clearRequested(token string) {
+	a.mu.Lock()
+	delete(a.requested, token)
+	a.mu.Unlock()
 }
 
 func (a *Agent) onFileChunk(_ string, payload []byte) error {
@@ -506,15 +565,41 @@ func (a *Agent) EnsureRemoteTransfer(state cache.RemoteClipboardState) error {
 	return nil
 }
 
+const (
+	// A stalled transfer is retried by asking the source device to stream the
+	// file again; a dropped chunk (slow consumer on the broker) then shows up as
+	// a short retry instead of a user visible paste failure.
+	transferStallRetries = 2
+	stalledReadTimeout   = 90 * time.Second
+)
+
 func (a *Agent) ReadRemoteFile(state cache.RemoteClipboardState, file protocol.FileMeta, offset int64, size int) ([]byte, error) {
 	if err := a.EnsureRemoteTransfer(state); err != nil {
 		return nil, err
 	}
 	chunk, err := a.receiver.ReadAt(state.Token, file, offset, size)
+	for attempt := 0; attempt < transferStallRetries && isTransferStall(err); attempt++ {
+		a.logger.Warn("restarting stalled transfer", "token", state.Token, "file", file.Name, "offset", offset, "attempt", attempt+1, "error", err)
+		if resetErr := a.receiver.Reset(state.Token); resetErr != nil {
+			a.logger.Warn("reset stalled transfer failed", "token", state.Token, "error", resetErr)
+			break
+		}
+		a.clearRequested(state.Token)
+		if ensureErr := a.EnsureRemoteTransfer(state); ensureErr != nil {
+			return nil, ensureErr
+		}
+		chunk, err = a.receiver.ReadAtWithTimeout(state.Token, file, offset, size, stalledReadTimeout)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return chunk, nil
+}
+
+// isTransferStall reports whether the read failed because data never arrived,
+// which is the only case worth restarting the transfer for.
+func isTransferStall(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "timeout waiting for file data")
 }
 
 func (a *Agent) requestImageTransfer(token string, sourceDevice string) error {
@@ -542,6 +627,7 @@ func (a *Agent) OnFileCompleted(file chunk.CompletedFile) error {
 }
 
 func (a *Agent) OnTransferError(token string, err error) error {
+	a.clearRequested(token)
 	a.logger.Error("file transfer failed", "token", token, "error", err)
 	return a.store.MarkFailed(token, err)
 }
@@ -566,6 +652,7 @@ func (a *Agent) OnImageCompleted(image chunk.CompletedImage) error {
 }
 
 func (a *Agent) OnImageTransferError(token string, err error) error {
+	a.clearRequested(token)
 	a.logger.Error("image transfer failed", "token", token, "error", err)
 	return nil
 }

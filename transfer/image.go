@@ -1,10 +1,12 @@
 package transfer
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,12 +14,14 @@ import (
 	"time"
 
 	"clipboard-sync/protocol"
+	"golang.org/x/image/bmp"
 )
 
 type ImageTokenManager struct {
 	ttl    time.Duration
 	mu     sync.RWMutex
 	items  map[string]imageEntry
+	latest string
 	stopCh chan struct{}
 }
 
@@ -25,6 +29,7 @@ type imageEntry struct {
 	Meta      protocol.ImageMeta
 	Path      string
 	CreatedAt time.Time
+	// ExpiresAt zero means "no expiry while this token is the latest one".
 	ExpiresAt time.Time
 }
 
@@ -45,18 +50,35 @@ func (m *ImageTokenManager) Issue(meta protocol.ImageMeta, path string) (string,
 	}
 	now := time.Now()
 	m.mu.Lock()
-	m.items[token] = imageEntry{Meta: meta, Path: path, CreatedAt: now, ExpiresAt: now.Add(m.ttl)}
+	if previous, ok := m.items[m.latest]; ok {
+		previous.ExpiresAt = now.Add(m.ttl)
+		m.items[m.latest] = previous
+	}
+	m.items[token] = imageEntry{Meta: meta, Path: path, CreatedAt: now}
+	m.latest = token
 	m.mu.Unlock()
 	return token, nil
 }
 
+// Lookup returns the image for a token and refreshes its validity window on a
+// hit. A token that is still the current clipboard content is always valid.
 func (m *ImageTokenManager) Lookup(token string) (protocol.ImageMeta, string, bool) {
-	m.mu.RLock()
+	now := time.Now()
+	m.mu.Lock()
 	entry, ok := m.items[token]
-	m.mu.RUnlock()
-	if !ok || time.Now().After(entry.ExpiresAt) {
+	if !ok {
+		m.mu.Unlock()
 		return protocol.ImageMeta{}, "", false
 	}
+	if token != m.latest {
+		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
+			m.mu.Unlock()
+			return protocol.ImageMeta{}, "", false
+		}
+		entry.ExpiresAt = now.Add(m.ttl)
+		m.items[token] = entry
+	}
+	m.mu.Unlock()
 	return entry.Meta, entry.Path, true
 }
 
@@ -69,7 +91,10 @@ func (m *ImageTokenManager) gcLoop() {
 			now := time.Now()
 			m.mu.Lock()
 			for token, entry := range m.items {
-				if now.After(entry.ExpiresAt) {
+				if token == m.latest {
+					continue
+				}
+				if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
 					delete(m.items, token)
 					_ = os.Remove(entry.Path)
 				}
@@ -79,6 +104,22 @@ func (m *ImageTokenManager) gcLoop() {
 			return
 		}
 	}
+}
+
+// ValidateImagePayload rejects clipboard payloads that are not real images. Some
+// applications advertise an image/png target but answer with a few bytes of junk,
+// which used to be published and then failed to decode on the receiving device.
+func ValidateImagePayload(data []byte) error {
+	if len(data) < 16 {
+		return fmt.Errorf("image payload too small: %d bytes", len(data))
+	}
+	if _, err := png.Decode(bytes.NewReader(data)); err == nil {
+		return nil
+	}
+	if _, err := bmp.Decode(bytes.NewReader(data)); err == nil {
+		return nil
+	}
+	return fmt.Errorf("image payload is neither decodable png nor bmp")
 }
 
 func StoreImageTemp(root string, data []byte, mime string) (protocol.ImageMeta, string, error) {

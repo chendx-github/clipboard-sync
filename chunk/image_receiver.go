@@ -30,6 +30,8 @@ type ImageReceiver struct {
 	callback ImageCallback
 	mu       sync.Mutex
 	sessions map[string]*imageSession
+	// failures remembers transfer failures reported by the source device.
+	failures map[string]failureRecord
 	stopCh   chan struct{}
 }
 
@@ -49,7 +51,7 @@ type imageSession struct {
 }
 
 func NewImageReceiver(root string, callback ImageCallback) *ImageReceiver {
-	receiver := &ImageReceiver{root: root, callback: callback, sessions: map[string]*imageSession{}, stopCh: make(chan struct{})}
+	receiver := &ImageReceiver{root: root, callback: callback, sessions: map[string]*imageSession{}, failures: map[string]failureRecord{}, stopCh: make(chan struct{})}
 	go receiver.gcLoop()
 	return receiver
 }
@@ -152,6 +154,9 @@ func (r *ImageReceiver) finishLocked(token string, session *imageSession) error 
 }
 
 func (r *ImageReceiver) ensureSessionLocked(token string, sourceDevice string) (*imageSession, error) {
+	if failure, ok := r.failures[token]; ok {
+		return nil, failure.err
+	}
 	if session, ok := r.sessions[token]; ok {
 		if session.sourceDevice == "" {
 			session.sourceDevice = sourceDevice
@@ -197,6 +202,13 @@ func (r *ImageReceiver) expireStaleSessions() {
 	for _, token := range expired {
 		_ = r.fail(token, fmt.Errorf("image transfer session timed out after %s", transferSessionTTL))
 	}
+	r.mu.Lock()
+	for token, failure := range r.failures {
+		if now.Sub(failure.at) > transferSessionTTL {
+			delete(r.failures, token)
+		}
+	}
+	r.mu.Unlock()
 }
 
 func (r *ImageReceiver) writeLocked(session *imageSession, data []byte) error {
@@ -213,7 +225,20 @@ func (r *ImageReceiver) fail(token string, err error) error {
 	return r.failLocked(token, err)
 }
 
+// FailToken marks a token as failed without requiring a local session. Used
+// when the source device reports that it cannot serve a transfer request.
+func (r *ImageReceiver) FailToken(token string, err error) error {
+	if err == nil {
+		err = fmt.Errorf("remote image transfer failed")
+	}
+	return r.fail(token, err)
+}
+
 func (r *ImageReceiver) failLocked(token string, err error) error {
+	if r.failures == nil {
+		r.failures = map[string]failureRecord{}
+	}
+	r.failures[token] = failureRecord{err: err, at: time.Now()}
 	if session, ok := r.sessions[token]; ok {
 		if session.writer != nil {
 			_ = session.writer.Close()

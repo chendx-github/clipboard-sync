@@ -31,11 +31,24 @@ type Receiver struct {
 	callback Callback
 	mu       sync.Mutex
 	sessions map[string]*fileSession
+	// failures remembers transfer failures reported by the source device so a
+	// later read for the same token fails immediately instead of waiting for
+	// a timeout.
+	failures map[string]failureRecord
 	stopCh   chan struct{}
 }
 
+type failureRecord struct {
+	err error
+	at  time.Time
+}
+
 const (
-	readWaitTimeout      = 2 * time.Minute
+	// readWaitTimeout bounds how long a reader (Explorer's UI thread, a file
+	// manager, ...) blocks waiting for the next chunk. It used to be 2 minutes,
+	// which made Explorer look hung (frozen cursor, no marquee selection) when
+	// the source device could not serve the request.
+	readWaitTimeout      = 5 * time.Second
 	transferSessionTTL   = 10 * time.Minute
 	maxPendingChunks     = 1024
 	maxPendingChunkBytes = 1024 * 1024 * 1024
@@ -63,7 +76,7 @@ type fileSession struct {
 }
 
 func NewReceiver(root string, callback Callback) *Receiver {
-	receiver := &Receiver{root: root, callback: callback, sessions: map[string]*fileSession{}, stopCh: make(chan struct{})}
+	receiver := &Receiver{root: root, callback: callback, sessions: map[string]*fileSession{}, failures: map[string]failureRecord{}, stopCh: make(chan struct{})}
 	go receiver.gcLoop()
 	return receiver
 }
@@ -194,6 +207,12 @@ func (r *Receiver) finish(session *fileSession, sha256Hex string, size int64, to
 }
 
 func (r *Receiver) ReadAt(token string, file protocol.FileMeta, offset int64, size int) ([]byte, error) {
+	return r.ReadAtWithTimeout(token, file, offset, size, readWaitTimeout)
+}
+
+// ReadAtWithTimeout is ReadAt with an explicit wait budget, used when the caller
+// knows the source device is re-streaming the whole file.
+func (r *Receiver) ReadAtWithTimeout(token string, file protocol.FileMeta, offset int64, size int, wait time.Duration) ([]byte, error) {
 	session, ok := r.lookup(token, file.ID)
 	if !ok {
 		if err := r.prepareFile(token, file); err != nil {
@@ -202,7 +221,7 @@ func (r *Receiver) ReadAt(token string, file protocol.FileMeta, offset int64, si
 		session, _ = r.lookup(token, file.ID)
 	}
 	session.mu.Lock()
-	deadline := time.Now().Add(readWaitTimeout)
+	deadline := time.Now().Add(wait)
 	for session.failed == nil && !session.completed && session.available <= offset {
 		if time.Now().After(deadline) {
 			session.mu.Unlock()
@@ -250,6 +269,9 @@ func (r *Receiver) ReadAt(token string, file protocol.FileMeta, offset int64, si
 func (r *Receiver) prepareFile(token string, file protocol.FileMeta) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if failure, ok := r.failures[token]; ok {
+		return failure.err
+	}
 	key := sessionKey(token, file.ID)
 	if _, ok := r.sessions[key]; ok {
 		return nil
@@ -350,9 +372,17 @@ func (r *Receiver) expireStaleSessions() {
 	for token := range expired {
 		_ = r.fail(token, fmt.Errorf("transfer session timed out after %s", transferSessionTTL))
 	}
+	r.mu.Lock()
+	for token, failure := range r.failures {
+		if now.Sub(failure.at) > transferSessionTTL {
+			delete(r.failures, token)
+		}
+	}
+	r.mu.Unlock()
 }
 
 func (r *Receiver) fail(token string, err error) error {
+	r.recordFailure(token, err)
 	r.mu.Lock()
 	var sessions []*fileSession
 	for key, session := range r.sessions {
@@ -380,6 +410,7 @@ func (r *Receiver) fail(token string, err error) error {
 
 func (r *Receiver) failSession(lockedSession *fileSession, err error) error {
 	token := lockedSession.token
+	r.recordFailure(token, err)
 	r.mu.Lock()
 	var sessions []*fileSession
 	for key, session := range r.sessions {
@@ -407,6 +438,48 @@ func (r *Receiver) failSession(lockedSession *fileSession, err error) error {
 		return fmt.Errorf("%v; callback error: %w", err, callbackErr)
 	}
 	return err
+}
+
+// Reset drops partial state for a token so the caller can re-request the whole
+// file from the source device (used when a chunk went missing).
+func (r *Receiver) Reset(token string) error {
+	r.mu.Lock()
+	for key, session := range r.sessions {
+		if session.token != token {
+			continue
+		}
+		session.mu.Lock()
+		if session.writer != nil && !session.closedWriter {
+			_ = session.writer.Close()
+			session.closedWriter = true
+		}
+		session.failed = fmt.Errorf("transfer restarted")
+		session.cond.Broadcast()
+		session.mu.Unlock()
+		delete(r.sessions, key)
+	}
+	delete(r.failures, token)
+	r.mu.Unlock()
+	_ = os.RemoveAll(filepath.Join(r.root, token))
+	return nil
+}
+
+// FailToken marks a token as failed without requiring a local session. Used
+// when the source device reports that it cannot serve a transfer request.
+func (r *Receiver) FailToken(token string, err error) error {
+	if err == nil {
+		err = fmt.Errorf("remote transfer failed")
+	}
+	return r.fail(token, err)
+}
+
+func (r *Receiver) recordFailure(token string, err error) {
+	r.mu.Lock()
+	if r.failures == nil {
+		r.failures = map[string]failureRecord{}
+	}
+	r.failures[token] = failureRecord{err: err, at: time.Now()}
+	r.mu.Unlock()
 }
 
 func sessionKey(token string, fileID string) string {

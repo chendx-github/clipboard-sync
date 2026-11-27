@@ -26,9 +26,12 @@ type Sender struct {
 const (
 	messageOverheadBytes = 4096
 	base64ExpansionRatio = 4.0 / 3.0
-	flushEveryChunks     = 16
-	flushEveryBytes      = 32 * 1024 * 1024
-	minFileChunkPayload  = 64 * 1024
+	// Publish in small batches: the broker buffers per subscriber and a fast
+	// burst of multi-megabyte chunks overruns it ("Slow Consumer Detected:
+	// MaxPending ... Exceeded"), which silently drops chunks mid-transfer.
+	flushEveryChunks    = 2
+	flushEveryBytes     = 4 * 1024 * 1024
+	minFileChunkPayload = 64 * 1024
 )
 
 func NewSender(groupID string, chunkSize int, client *mq.Client, logger *slog.Logger, deviceID string) *Sender {
