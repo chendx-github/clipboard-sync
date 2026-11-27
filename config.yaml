@@ -1,7 +1,7 @@
 device_id: "你的设备key"
 group_id: "xxx你的key"
 nats_url: "nats://10.20.15.242:4222"
-chunk_size: 8388608
+chunk_size: 1048576
 token_ttl: 60
 poll_interval_ms: 500
 cache_dir: ""
