@@ -70,13 +70,17 @@ var (
 	remoteFormatOnce        sync.Once
 	remoteClipboardFormatID uint32
 	pngFormatID             uint32
-	watchNotify             chan struct{}
-	watchNotifyMu           sync.Mutex
-	clipboardOwnerHwnd      uintptr
-	clipboardOwnerMu        sync.Mutex
-	delayedDIB              []byte
-	delayedDIBMu            sync.Mutex
-	wndProcCallback         = syscall.NewCallback(clipboardWndProc)
+	// Windows clipboard-monitor control formats (see writeMonitorExclusionFormats).
+	excludeMonitorFormatID uint32
+	canIncludeHistoryID    uint32
+	canUploadCloudID       uint32
+	watchNotify            chan struct{}
+	watchNotifyMu          sync.Mutex
+	clipboardOwnerHwnd     uintptr
+	clipboardOwnerMu       sync.Mutex
+	delayedDIB             []byte
+	delayedDIBMu           sync.Mutex
+	wndProcCallback        = syscall.NewCallback(clipboardWndProc)
 )
 
 type windowsClipboard struct {
@@ -149,6 +153,9 @@ func New(pollInterval time.Duration, _ string) (Clipboard, error) {
 		pngName, _ := windows.UTF16PtrFromString("PNG")
 		pngRet, _, _ := procAddClipboardFormat.Call(uintptr(unsafe.Pointer(pngName)))
 		pngFormatID = uint32(pngRet)
+		excludeMonitorFormatID = registerFormatID("ExcludeClipboardContentFromMonitorProcessing")
+		canIncludeHistoryID = registerFormatID("CanIncludeInClipboardHistory")
+		canUploadCloudID = registerFormatID("CanUploadToCloudClipboard")
 	})
 	return &windowsClipboard{pollInterval: pollInterval}, nil
 }
@@ -255,6 +262,7 @@ func (c *windowsClipboard) Write(data Data) error {
 	if _, _, err := procEmptyClipboard.Call(); err != syscall.Errno(0) {
 		return fmt.Errorf("empty clipboard: %w", err)
 	}
+	writeMonitorExclusionFormats()
 
 	switch data.Type {
 	case DataTypeText:
@@ -504,6 +512,52 @@ func readClipboardFormat(format uint32) (string, error) {
 	defer procGlobalUnlock.Call(h)
 	text := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(ptr)))
 	return text, nil
+}
+
+func registerFormatID(name string) uint32 {
+	ptr, err := windows.UTF16PtrFromString(name)
+	if err != nil {
+		return 0
+	}
+	ret, _, _ := procAddClipboardFormat.Call(uintptr(unsafe.Pointer(ptr)))
+	return uint32(ret)
+}
+
+// writeMonitorExclusionFormats tells clipboard monitors / history / cloud
+// clipboard to skip the content we just placed. Without it, a background
+// clipboard manager happily records remote content (and, for file drops, reads
+// the virtual files through our stream), which is exactly the unwanted
+// "leak into background programs" behaviour.
+func writeMonitorExclusionFormats() {
+	_ = writeGlobalClipboardData(excludeMonitorFormatID, nil)
+	_ = writeGlobalClipboardData(canIncludeHistoryID, make([]byte, 4))
+	_ = writeGlobalClipboardData(canUploadCloudID, make([]byte, 4))
+}
+
+func writeGlobalClipboardData(format uint32, data []byte) error {
+	if format == 0 {
+		return nil
+	}
+	size := uintptr(len(data))
+	if size == 0 {
+		size = 1
+	}
+	hMem, _, err := procGlobalAlloc.Call(gmemeMoveable, size)
+	if hMem == 0 {
+		return fmt.Errorf("global alloc: %w", err)
+	}
+	ptr, _, err := procGlobalLock.Call(hMem)
+	if ptr == 0 {
+		return fmt.Errorf("global lock: %w", err)
+	}
+	if len(data) > 0 {
+		copy(unsafe.Slice((*byte)(unsafe.Pointer(ptr)), len(data)), data)
+	}
+	procGlobalUnlock.Call(hMem)
+	if ret, _, err := procSetClipboardData.Call(uintptr(format), hMem); ret == 0 {
+		return fmt.Errorf("set clipboard data: %w", err)
+	}
+	return nil
 }
 
 func writeUnicodeText(format uint32, text string) error {

@@ -5,8 +5,10 @@ package clipboard
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -30,6 +32,41 @@ const (
 	backendXclip linuxBackend = iota
 	backendWayland
 )
+
+// Clipboard helpers (xclip / wl-paste) talk to whatever application currently
+// owns the selection. A wedged owner never answers a conversion request and
+// xclip then blocks forever, which used to freeze the whole clipboard watcher
+// (the agent silently stopped publishing until it was restarted). Every query
+// therefore runs under a hard timeout and the helper is killed when it fires.
+const (
+	clipboardQueryTimeout   = 3 * time.Second
+	clipboardPayloadTimeout = 20 * time.Second
+	clipboardWriteTimeout   = 15 * time.Second
+)
+
+func runClipboardCommand(timeout time.Duration, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("clipboard command %s %s timed out after %s", name, strings.Join(args, " "), timeout)
+	}
+	return out, err
+}
+
+func runClipboardWrite(timeout time.Duration, name string, args []string, stdin io.Reader) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin = stdin
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("clipboard command %s %s timed out after %s", name, strings.Join(args, " "), timeout)
+		}
+		return err
+	}
+	return nil
+}
 
 func New(pollInterval time.Duration, fileFormat string) (Clipboard, error) {
 	backend, err := detectLinuxBackend()
@@ -119,11 +156,18 @@ func (c *linuxClipboard) Write(data Data) error {
 
 func (c *linuxClipboard) Watch(out chan Data) {
 	go func() {
+		var lastTimeoutLog time.Time
 		for {
 			data, err := c.Read()
 			if err == nil && !data.Empty() && data.Fingerprint != "" && data.Fingerprint != c.last {
 				c.last = data.Fingerprint
 				out <- data
+			}
+			// A timed out read means a clipboard owner stopped answering. Say so
+			// once in a while instead of silently going quiet for hours.
+			if err != nil && strings.Contains(err.Error(), "timed out") && time.Since(lastTimeoutLog) > time.Minute {
+				lastTimeoutLog = time.Now()
+				fmt.Fprintf(os.Stderr, "clipboard read skipped: %v\n", err)
 			}
 			time.Sleep(c.pollInterval)
 		}
@@ -151,13 +195,15 @@ func shouldUseWayland(sessionType string, waylandDisplay string) bool {
 }
 
 func (c *linuxClipboard) readText() (string, error) {
-	var cmd *exec.Cmd
+	var (
+		out []byte
+		err error
+	)
 	if c.backend == backendWayland {
-		cmd = exec.Command("wl-paste", "--no-newline")
+		out, err = runClipboardCommand(clipboardPayloadTimeout, "wl-paste", "--no-newline")
 	} else {
-		cmd = exec.Command("xclip", "-selection", "clipboard", "-o")
+		out, err = runClipboardCommand(clipboardPayloadTimeout, "xclip", "-selection", "clipboard", "-o")
 	}
-	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("read clipboard text: %w", err)
 	}
@@ -174,13 +220,13 @@ func (c *linuxClipboard) readFiles() ([]string, error) {
 
 func (c *linuxClipboard) readFileListPayload() (string, error) {
 	if c.backend == backendWayland {
-		mimeTypes, err := exec.Command("wl-paste", "--list-types").Output()
+		mimeTypes, err := runClipboardCommand(clipboardQueryTimeout, "wl-paste", "--list-types")
 		if err != nil {
 			return "", fmt.Errorf("list clipboard mime types: %w", err)
 		}
 		for _, mime := range []string{"text/uri-list", "x-special/gnome-copied-files"} {
 			if bytes.Contains(mimeTypes, []byte(mime)) {
-				out, err := exec.Command("wl-paste", "--type", mime, "--no-newline").Output()
+				out, err := runClipboardCommand(clipboardPayloadTimeout, "wl-paste", "--type", mime, "--no-newline")
 				if err != nil {
 					return "", fmt.Errorf("read clipboard mime %s: %w", mime, err)
 				}
@@ -194,8 +240,7 @@ func (c *linuxClipboard) readFileListPayload() (string, error) {
 	}
 
 	for _, target := range []string{"x-special/gnome-copied-files", "text/uri-list"} {
-		cmd := exec.Command("xclip", "-selection", "clipboard", "-t", target, "-o")
-		out, err := cmd.Output()
+		out, err := runClipboardCommand(clipboardPayloadTimeout, "xclip", "-selection", "clipboard", "-t", target, "-o")
 		if err == nil && len(out) > 0 {
 			return string(out), nil
 		}
@@ -214,7 +259,7 @@ func (c *linuxClipboard) readFileListPayload() (string, error) {
 func (c *linuxClipboard) readNautilusClipboardText() (string, bool) {
 	var candidates []string
 	if c.backend == backendWayland {
-		mimeTypes, err := exec.Command("wl-paste", "--list-types").Output()
+		mimeTypes, err := runClipboardCommand(clipboardQueryTimeout, "wl-paste", "--list-types")
 		if err != nil {
 			return "", false
 		}
@@ -232,9 +277,9 @@ func (c *linuxClipboard) readNautilusClipboardText() (string, bool) {
 			err error
 		)
 		if c.backend == backendWayland {
-			out, err = exec.Command("wl-paste", "--type", target, "--no-newline").Output()
+			out, err = runClipboardCommand(clipboardPayloadTimeout, "wl-paste", "--type", target, "--no-newline")
 		} else {
-			out, err = exec.Command("xclip", "-selection", "clipboard", "-t", target, "-o").Output()
+			out, err = runClipboardCommand(clipboardPayloadTimeout, "xclip", "-selection", "clipboard", "-t", target, "-o")
 		}
 		if err != nil || len(out) == 0 {
 			continue
@@ -306,16 +351,12 @@ func (c *linuxClipboard) writeFiles(files []string) error {
 	}
 	mime, payload := fileClipboardPayload(c.fileFormat, files)
 	if c.backend == backendWayland {
-		cmd := exec.Command("wl-copy", "--type", mime)
-		cmd.Stdin = strings.NewReader(payload)
-		if err := cmd.Run(); err != nil {
+		if err := runClipboardWrite(clipboardWriteTimeout, "wl-copy", []string{"--type", mime}, strings.NewReader(payload)); err != nil {
 			return fmt.Errorf("write file clipboard %s: %w", mime, err)
 		}
 		return nil
 	}
-	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", mime)
-	cmd.Stdin = strings.NewReader(payload)
-	if err := cmd.Run(); err != nil {
+	if err := runClipboardWrite(clipboardWriteTimeout, "xclip", []string{"-selection", "clipboard", "-t", mime}, strings.NewReader(payload)); err != nil {
 		return fmt.Errorf("write file clipboard %s: %w", mime, err)
 	}
 	return nil
@@ -354,13 +395,13 @@ func fileURIToPath(uri string) (string, error) {
 
 func (c *linuxClipboard) readImage() ([]byte, string, error) {
 	if c.backend == backendWayland {
-		mimeTypes, err := exec.Command("wl-paste", "--list-types").Output()
+		mimeTypes, err := runClipboardCommand(clipboardQueryTimeout, "wl-paste", "--list-types")
 		if err != nil {
 			return nil, "", fmt.Errorf("list clipboard mime types: %w", err)
 		}
 		for _, mime := range []string{"image/png", "image/bmp"} {
 			if bytes.Contains(mimeTypes, []byte(mime)) {
-				out, err := exec.Command("wl-paste", "--type", mime).Output()
+				out, err := runClipboardCommand(clipboardPayloadTimeout, "wl-paste", "--type", mime)
 				if err != nil {
 					return nil, "", fmt.Errorf("read clipboard image %s: %w", mime, err)
 				}
@@ -370,7 +411,7 @@ func (c *linuxClipboard) readImage() ([]byte, string, error) {
 		return nil, "", errors.New("no image mime type in clipboard")
 	}
 	for _, mime := range []string{"image/png", "image/bmp"} {
-		out, err := exec.Command("xclip", "-selection", "clipboard", "-t", mime, "-o").Output()
+		out, err := runClipboardCommand(clipboardPayloadTimeout, "xclip", "-selection", "clipboard", "-t", mime, "-o")
 		if err == nil && len(out) > 0 {
 			return out, mime, nil
 		}
@@ -386,16 +427,12 @@ func (c *linuxClipboard) writeImage(image []byte, mime string) error {
 		mime = "image/png"
 	}
 	if c.backend == backendWayland {
-		cmd := exec.Command("wl-copy", "--type", mime)
-		cmd.Stdin = bytes.NewReader(image)
-		if err := cmd.Run(); err != nil {
+		if err := runClipboardWrite(clipboardWriteTimeout, "wl-copy", []string{"--type", mime}, bytes.NewReader(image)); err != nil {
 			return fmt.Errorf("write wayland image: %w", err)
 		}
 		return nil
 	}
-	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", mime)
-	cmd.Stdin = bytes.NewReader(image)
-	if err := cmd.Run(); err != nil {
+	if err := runClipboardWrite(clipboardWriteTimeout, "xclip", []string{"-selection", "clipboard", "-t", mime}, bytes.NewReader(image)); err != nil {
 		return fmt.Errorf("write xclip image: %w", err)
 	}
 	return nil
@@ -403,7 +440,7 @@ func (c *linuxClipboard) writeImage(image []byte, mime string) error {
 
 func (c *linuxClipboard) detectClipboardKinds() (hasText bool, hasImage bool) {
 	if c.backend == backendWayland {
-		mimeTypes, err := exec.Command("wl-paste", "--list-types").Output()
+		mimeTypes, err := runClipboardCommand(clipboardQueryTimeout, "wl-paste", "--list-types")
 		if err != nil {
 			return true, false
 		}
@@ -411,7 +448,7 @@ func (c *linuxClipboard) detectClipboardKinds() (hasText bool, hasImage bool) {
 		return strings.Contains(mimeText, "text/plain") || strings.Contains(mimeText, "UTF8_STRING") || strings.Contains(mimeText, "STRING"),
 			strings.Contains(mimeText, "image/png") || strings.Contains(mimeText, "image/bmp")
 	}
-	out, err := exec.Command("xclip", "-selection", "clipboard", "-t", "TARGETS", "-o").Output()
+	out, err := runClipboardCommand(clipboardQueryTimeout, "xclip", "-selection", "clipboard", "-t", "TARGETS", "-o")
 	if err != nil {
 		return true, false
 	}

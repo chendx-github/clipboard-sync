@@ -154,12 +154,15 @@ func (s *Store) writeJSON(path string, value any) error {
 	if err != nil {
 		return fmt.Errorf("marshal json: %w", err)
 	}
-	tmpPath := path + ".tmp"
+	// A per-process temp name keeps concurrent writers (or a leftover instance
+	// of the same agent) from stealing each other's temp file mid-rename.
+	tmpPath := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
 	if err := os.WriteFile(tmpPath, payload, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", tmpPath, err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("rename %s: %w", path, err)
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename %s -> %s: %w", tmpPath, path, err)
 	}
 	return nil
 }

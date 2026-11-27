@@ -50,10 +50,17 @@ var (
 	procTranslateMessage      = modUser32.NewProc("TranslateMessage")
 	procDispatchMessage       = modUser32.NewProc("DispatchMessageW")
 
-	cfFileDescriptorW   uint16
-	cfFileContents      uint16
-	registerFormatsOnce sync.Once
-	clipboardThread     *windowsPresenter
+	cfFileDescriptorW uint16
+	cfFileContents    uint16
+	// Formats Windows clipboard monitors/history honour. Advertising them keeps
+	// remote clipboard content from being recorded by background clipboard
+	// managers (CopyQ, clipboard history, cloud clipboard) that then read the
+	// virtual files and trigger transfers nobody asked for.
+	cfExcludeFromMonitor  uint16
+	cfCanIncludeInHistory uint16
+	cfCanUploadToCloud    uint16
+	registerFormatsOnce   sync.Once
+	clipboardThread       *windowsPresenter
 )
 
 type windowsPresenter struct {
@@ -67,6 +74,28 @@ type windowsPresenter struct {
 	vtbl     *iDataObjectVtbl
 	self     unsafe.Pointer
 	requests chan clipboardRequest
+}
+
+func (p *windowsPresenter) removeStream(stream *remoteFileStream) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, current := range p.streams {
+		if current == stream {
+			p.streams = append(p.streams[:i], p.streams[i+1:]...)
+			return
+		}
+	}
+}
+
+func (p *windowsPresenter) removeEnumerator(enum *formatEnumerator) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, current := range p.enums {
+		if current == enum {
+			p.enums = append(p.enums[:i], p.enums[i+1:]...)
+			return
+		}
+	}
 }
 
 type clipboardRequest struct {
@@ -205,10 +234,11 @@ type remoteFileStream struct {
 }
 
 type formatEnumerator struct {
-	vtbl     *iEnumFormatEtcVtbl
-	refCount int32
-	formats  []formatEtc
-	index    int
+	vtbl      *iEnumFormatEtcVtbl
+	presenter *windowsPresenter
+	refCount  int32
+	formats   []formatEtc
+	index     int
 }
 
 var (
@@ -279,11 +309,23 @@ func (p *windowsPresenter) Close() error {
 
 func (p *windowsPresenter) setClipboard() error {
 	obj := (*iDataObject)(p.self)
-	hr, _, _ := procOleSetClipboard.Call(uintptr(unsafe.Pointer(obj)))
-	if hr != 0 {
-		return fmt.Errorf("OleSetClipboard failed: 0x%x", hr)
+	var last uintptr
+	// Other clipboard owners (Explorer, RDP clipboard, CopyQ, ...) can hold the
+	// clipboard open for a few dozen milliseconds; OleSetClipboard then fails
+	// with CLIPBRD_E_CANT_OPEN / CLIPBRD_E_CANT_EMPTY. Retry briefly instead of
+	// dropping the remote clipboard content.
+	for attempt := 0; attempt < 10; attempt++ {
+		hr, _, _ := procOleSetClipboard.Call(uintptr(unsafe.Pointer(obj)))
+		if hr == 0 {
+			return nil
+		}
+		last = hr
+		if hr != 0x800401D0 && hr != 0x800401D1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return nil
+	return fmt.Errorf("OleSetClipboard failed: 0x%x", last)
 }
 
 func (p *windowsPresenter) clipboardLoop() {
@@ -301,8 +343,6 @@ func (p *windowsPresenter) clipboardLoop() {
 		case request := <-p.requests:
 			p.mu.Lock()
 			p.state = request.state
-			p.streams = nil
-			p.enums = nil
 			p.mu.Unlock()
 			request.result <- p.setClipboard()
 		default:
@@ -334,6 +374,9 @@ func registerClipboardFormats() {
 	registerFormatsOnce.Do(func() {
 		cfFileDescriptorW = registerClipboardFormat("FileGroupDescriptorW")
 		cfFileContents = registerClipboardFormat("FileContents")
+		cfExcludeFromMonitor = registerClipboardFormat("ExcludeClipboardContentFromMonitorProcessing")
+		cfCanIncludeInHistory = registerClipboardFormat("CanIncludeInClipboardHistory")
+		cfCanUploadToCloud = registerClipboardFormat("CanUploadToCloudClipboard")
 	})
 }
 
@@ -401,17 +444,18 @@ func dataObjectGetData(this uintptr, format uintptr, medium uintptr) uintptr {
 		return 0
 	}
 	if fe.cfFormat == cfFileContents && fe.tymed&tymedHGlobal != 0 {
-		if fe.lindex < 0 || fe.lindex >= int32(len(state.Files)) {
-			return 0x80040064
-		}
-		file := state.Files[fe.lindex]
-		if file.Size > maxHGlobalFile {
-			return 0x80040064
-		}
-		payload, err := readFullRemoteFile(p.accessor, state, file)
-		if err != nil {
-			slog.Error("windows dataobject hglobal read failed", "file", file.Name, "error", err)
-			return hResultFromError(err)
+		// Never serve file contents as a single HGlobal: the caller would read
+		// the whole file synchronously inside its own UI thread (Explorer then
+		// freezes: no busy cursor, no marquee selection). QueryGetData rejects
+		// this combination as well, so callers stream instead.
+		return 0x80040064
+	}
+	if fe.tymed&tymedHGlobal != 0 && isMonitorControlFormat(fe.cfFormat) {
+		payload := []byte{}
+		if fe.cfFormat != cfExcludeFromMonitor {
+			// CanIncludeInClipboardHistory / CanUploadToCloudClipboard carry a
+			// DWORD; 0 means "do not keep / do not upload".
+			payload = make([]byte, 4)
 		}
 		h, err := allocHGlobal(payload)
 		if err != nil {
@@ -420,7 +464,6 @@ func dataObjectGetData(this uintptr, format uintptr, medium uintptr) uintptr {
 		sm.tymed = tymedHGlobal
 		sm.unionMember = h
 		sm.pUnkForRelease = 0
-		slog.Info("windows dataobject hglobal delivered", "file", file.Name, "size", len(payload))
 		return 0
 	}
 	return 0x80040064
@@ -433,14 +476,16 @@ func dataObjectQueryGetData(this uintptr, format uintptr) uintptr {
 	if fe.cfFormat == cfFileContents {
 		slog.Info("windows dataobject querygetdata", "format", clipboardFormatName(fe.cfFormat), "tymed", fe.tymed, "lindex", fe.lindex)
 	}
+	if fe.tymed&tymedHGlobal != 0 && isMonitorControlFormat(fe.cfFormat) {
+		return 0
+	}
 	if fe.cfFormat == cfFileDescriptorW && fe.tymed&tymedHGlobal != 0 {
 		return 0
 	}
 	if fe.cfFormat == cfFileContents && fe.tymed&tymedHGlobal != 0 {
-		state := presenterFromIUnknown(this).currentState()
-		if fe.lindex >= 0 && fe.lindex < int32(len(state.Files)) && state.Files[fe.lindex].Size <= maxHGlobalFile {
-			return 0
-		}
+		// HGlobal is deliberately not advertised: it force-feeds the whole
+		// file through the caller's UI thread and hangs Explorer.
+		return 0x80040064
 	}
 	if fe.cfFormat == cfFileContents && fe.tymed&tymedIStream != 0 {
 		return 0
@@ -462,13 +507,16 @@ func dataObjectEnumFormatEtc(this uintptr, direction uintptr, out uintptr) uintp
 	}
 	p := presenterFromIUnknown(this)
 	state := p.currentState()
-	formats := make([]formatEtc, 0, len(state.Files)+1)
+	formats := make([]formatEtc, 0, len(state.Files)+4)
 	formats = append(formats, formatEtc{cfFormat: cfFileDescriptorW, dwAspect: dvaspectContent, lindex: -1, tymed: tymedHGlobal})
+	for _, cf := range []uint16{cfExcludeFromMonitor, cfCanIncludeInHistory, cfCanUploadToCloud} {
+		formats = append(formats, formatEtc{cfFormat: cf, dwAspect: dvaspectContent, lindex: -1, tymed: tymedHGlobal})
+	}
 	for idx := range state.Files {
 		formats = append(formats, formatEtc{cfFormat: cfFileContents, dwAspect: dvaspectContent, lindex: int32(idx), tymed: fileContentsTymed(state.Files[idx])})
 	}
 	slog.Debug("windows dataobject enumformatetc", "files", len(state.Files), "formats", len(formats))
-	enum := &formatEnumerator{vtbl: enumFormatEtcVTable, refCount: 1, formats: formats}
+	enum := &formatEnumerator{vtbl: enumFormatEtcVTable, presenter: p, refCount: 1, formats: formats}
 	p.mu.Lock()
 	p.enums = append(p.enums, enum)
 	p.mu.Unlock()
@@ -499,15 +547,26 @@ func streamRelease(this uintptr) uintptr {
 	s := (*remoteFileStream)(unsafe.Pointer(this))
 	value := atomic.AddInt32(&s.refCount, -1)
 	if value <= 0 {
+		if s.presenter != nil {
+			s.presenter.removeStream(s)
+		}
 		return 0
 	}
 	return uintptr(value)
 }
 
+// maxStreamReadChunk bounds how much data one IStream::Read call may pull. A
+// caller that asks for a whole 100 MB file would otherwise keep us busy inside
+// its own UI thread until the transfer finished.
+const maxStreamReadChunk = 1024 * 1024
+
 func streamRead(this uintptr, pv uintptr, cb uint32, pcbRead uintptr) uintptr {
 	s := (*remoteFileStream)(unsafe.Pointer(this))
 	start := s.offset
 	request := int(cb)
+	if request > maxStreamReadChunk {
+		request = maxStreamReadChunk
+	}
 	if remaining := s.file.Size - s.offset; remaining <= 0 {
 		if pcbRead != 0 {
 			*(*uint32)(unsafe.Pointer(pcbRead)) = 0
@@ -537,7 +596,9 @@ func streamRead(this uintptr, pv uintptr, cb uint32, pcbRead uintptr) uintptr {
 		*(*uint32)(unsafe.Pointer(pcbRead)) = uint32(len(chunk))
 	}
 	slog.Debug("windows file stream read", "file", s.file.Name, "offset", start, "requested", cb, "returned", len(chunk), "err", err)
-	if len(chunk) == 0 {
+	if len(chunk) < int(cb) {
+		// S_FALSE: fewer bytes than requested (capped or partial read); the
+		// caller comes back for the rest instead of us blocking further.
 		return 1
 	}
 	return 0
@@ -570,11 +631,15 @@ func streamCopyTo(this uintptr, dest uintptr, cb uint64, pcbRead uintptr, pcbWri
 		return 0x80070057
 	}
 	s := (*remoteFileStream)(unsafe.Pointer(this))
+	const maxCopyToPerCall = 4 * 1024 * 1024
 	remaining := cb
 	if s.offset >= s.file.Size {
 		remaining = 0
 	} else if remaining > uint64(s.file.Size-s.offset) {
 		remaining = uint64(s.file.Size - s.offset)
+	}
+	if remaining > maxCopyToPerCall {
+		remaining = maxCopyToPerCall
 	}
 	bufferSize := 64 * 1024
 	buffer := make([]byte, bufferSize)
@@ -655,6 +720,9 @@ func enumFormatEtcRelease(this uintptr) uintptr {
 	e := (*formatEnumerator)(unsafe.Pointer(this))
 	value := atomic.AddInt32(&e.refCount, -1)
 	if value <= 0 {
+		if e.presenter != nil {
+			e.presenter.removeEnumerator(e)
+		}
 		return 0
 	}
 	return uintptr(value)
@@ -667,6 +735,9 @@ func enumFormatEtcNext(this uintptr, count uint32, rgelt uintptr, fetched uintpt
 			*(*uint32)(unsafe.Pointer(fetched)) = 0
 		}
 		return 1
+	}
+	if rgelt == 0 {
+		return 0x80070057
 	}
 	returned := uint32(0)
 	for returned < count && e.index < len(e.formats) {
@@ -703,8 +774,16 @@ func enumFormatEtcReset(this uintptr) uintptr {
 
 func enumFormatEtcClone(this uintptr, out uintptr) uintptr {
 	e := (*formatEnumerator)(unsafe.Pointer(this))
+	if out == 0 {
+		return 0x80070057
+	}
 	cloneFormats := append([]formatEtc(nil), e.formats...)
-	clone := &formatEnumerator{vtbl: enumFormatEtcVTable, refCount: 1, formats: cloneFormats, index: e.index}
+	clone := &formatEnumerator{vtbl: enumFormatEtcVTable, presenter: e.presenter, refCount: 1, formats: cloneFormats, index: e.index}
+	if e.presenter != nil {
+		e.presenter.mu.Lock()
+		e.presenter.enums = append(e.presenter.enums, clone)
+		e.presenter.mu.Unlock()
+	}
 	*(*uintptr)(unsafe.Pointer(out)) = uintptr(unsafe.Pointer(clone))
 	return 0
 }
@@ -766,7 +845,7 @@ func readFullRemoteFile(accessor TransferAccessor, state cache.RemoteClipboardSt
 	}
 	payload := make([]byte, 0, int(file.Size))
 	var offset int64
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(30 * time.Second)
 	for offset < file.Size {
 		remaining := file.Size - offset
 		request := 512 * 1024
@@ -817,15 +896,27 @@ func clipboardFormatName(format uint16) string {
 		return "FileGroupDescriptorW"
 	case cfFileContents:
 		return "FileContents"
+	case cfExcludeFromMonitor:
+		return "ExcludeClipboardContentFromMonitorProcessing"
+	case cfCanIncludeInHistory:
+		return "CanIncludeInClipboardHistory"
+	case cfCanUploadToCloud:
+		return "CanUploadToCloudClipboard"
 	default:
 		return fmt.Sprintf("format_%d", format)
 	}
 }
 
+func isMonitorControlFormat(format uint16) bool {
+	return format == cfExcludeFromMonitor || format == cfCanIncludeInHistory || format == cfCanUploadToCloud
+}
+
+// fileContentsTymed advertises only TYMED_ISTREAM. Offering TYMED_HGLOBAL made
+// Explorer read the whole file synchronously inside its UI thread (up to
+// maxHGlobalFile), which froze the window: no busy cursor, no marquee
+// selection, no progress dialog. A stream lets Explorer pull data
+// progressively and keeps its message loop alive.
 func fileContentsTymed(file protocol.FileMeta) uint32 {
-	if file.Size <= maxHGlobalFile {
-		return tymedIStream | tymedHGlobal
-	}
 	return tymedIStream
 }
 

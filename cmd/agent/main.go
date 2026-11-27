@@ -40,6 +40,9 @@ func run(args []string) error {
 }
 
 func runAgent(args []string) error {
+	if err := ensureSingleInstance(); err != nil {
+		return err
+	}
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	configPath := fs.String("config", "configs/config.yaml", "path to config yaml")
 	if err := fs.Parse(args); err != nil {
